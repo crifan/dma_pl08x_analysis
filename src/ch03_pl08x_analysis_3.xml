@@ -1,0 +1,481 @@
+<?xml version='1.0' encoding="utf-8"?>
+
+<!DOCTYPE chapter>
+
+<chapter xmlns="http://docbook.org/ns/docbook"
+    xml:id="ch03_pl08x_analysis_3"
+    xmlns:xi="http://www.w3.org/2001/XInclude">
+
+<title>ARM的PL08X的代码的详细解析 第三部分</title>
+<abstract></abstract>
+
+<sect1><title>简述PL08X的DMA驱动的基本流程</title>
+    <para>接下来将要解释的这些函数，都是挂靠在DMA Engine架构下面的函数。</para>
+    <para>此 pl08x的DMA驱动也要是实现对应的函数，以便其他程序调用这些接口使用pl08x。</para>
+    <para>下面简单介绍一下通用的调用此pl08x的DMA驱动的大概流程：</para>
+    <orderedlist>
+        <listitem>得到当前可以用于DMA传输的数据buffer
+            <itemizedlist>
+                <listitem>如果已经有了普的数据buffer，那么一般用<function>dma_map_single</function>去将普通的CPU访问的buffer映射成DMA可以访问的buffer</listitem>
+                <listitem>如果没有现存buffer，那么一般用<function>dma_alloc_writecombine</function>，自己申请一个，申请的此buffer，是combine，绑定一起的，即不论是DMA还是CPU，都可以访问的</listitem>
+            </itemizedlist>
+        </listitem>
+        <listitem>根据自己的需求，设置好传输的client的一堆参数后，然后调用
+            <para>dma_async_client_register(txclient);</para>
+            <para>dma_async_client_chan_request(txclient);</para>
+            <para></para>
+            去注册申请对应的client。
+        </listitem>
+        <listitem>设置好scatter/gather list的信息后，调用
+            <para>device_prep_slave_sg</para>
+            去寻找并获得和自己匹配的那个描述符desc</listitem>
+        <listitem>然后设置对应的callback函数和对应参数
+            <para>desc->callback = as353x_nand_dma_complete_callback;</para>
+            <para>desc->callback_param = &amp;info->callback_param;</para>
+            <note>
+                <para>callback函数里面，会调用<function>complete(&amp;info-&gt;done);</function>去完成对应的变量</para>
+                <para>而你的callback函数，会在DMA完全传输完毕后，DMA驱动中的irq中会被调用。</para>
+            </note>
+        </listitem>
+        <listitem>都准备好了后，再调用
+            <para>desc->tx_submit(desc);</para>
+            去提交你的DMA请求
+        </listitem>
+        <listitem>一切完毕后，调用
+            <para>info->txchan->device->device_issue_pending(info->txchan);</para>
+            真正的开始DMA的数据传输。
+        </listitem>
+        <listitem>之后，你就可以调用
+            <para>wait_for_completion_timeout</para>
+            去等待你的传输完毕了。
+        </listitem>
+    </orderedlist>
+</sect1>
+
+
+<sect1><title>pl08x_alloc_chan_resources</title>
+    <programlistingco>
+        <programlisting language="c" >
+/* ===============================================================
+ * The DMA ENGINE API
+ * ===============================================================
+ */
+static int pl08x_alloc_chan_resources(struct dma_chan *chan,
+					struct dma_client *client)
+{
+	struct pl08x_dma_chan *local_chan = container_of
+				(chan, struct pl08x_dma_chan, chan);
+
+	int assigned = 0;
+	/*
+	 * Channels may be reserved for slaves
+	 * Channels doing slave DMA can only handle one client
+	 */
+	if (local_chan-&lt;slave_only) {
+		if (!client-&lt;slave)
+			return -EBUSY;
+	} else	if (client-&lt;slave)
+		return -EBUSY;
+
+
+	/* Slave DMA clients can only use one channel each */
+	if ((client-&lt;slave) &amp;&amp; (chan-&lt;client_count))
+		return -EBUSY;
+	else {
+		<co id="co.one_slave_one_chan" linkends="co.note.one_slave_one_chan" />/* Channels doing slave DMA can only handle one client. */
+		if ((local_chan-&lt;slave) &amp;&amp; (chan-&lt;client_count)) {
+			dev_err(&amp;pd.dmac-&lt;dev,
+				"%s - channel %d already has a slave - local_chan-&lt;slave %p\n",
+					__func__,
+					local_chan-&lt;chan_id,
+					local_chan-&lt;slave);
+			return -EBUSY;
+		}
+
+		/* Check channel is idle */
+		if (pl08x_dma_busy(local_chan-&lt;chan_id)) {
+			dev_err(&amp;pd.dmac-&lt;dev,
+				"%s - channel %d not idle\n",
+					__func__, local_chan-&lt;chan_id);
+			return -EIO;
+		}
+		local_chan-&lt;slave = client-&lt;slave;
+	}
+
+	return assigned;
+}
+        </programlisting>
+        <calloutlist>
+            <callout id="co.note.one_slave_one_chan" arearefs="co.one_slave_one_chan" >
+                <para>这部分没完全看懂，直译是用Slave DMA的channel，只能有一个client，但是具体为什么，不懂。。。</para>
+            </callout>
+        </calloutlist>
+    </programlistingco>
+</sect1>
+
+<sect1><title>pl08x_free_chan_resources</title>
+    <programlistingco>
+        <programlisting language="c" >
+static void pl08x_free_chan_resources(struct dma_chan *chan)
+{
+	dev_warn(&amp;pd.dmac-&gt;dev, "%s - UNIMPLEMENTED\n", __func__);
+}
+        </programlisting>
+    </programlistingco>
+</sect1>
+
+<sect1><title>pl08x_tx_submit</title>
+    <programlistingco>
+        <programlisting language="c" >
+/*
+ * First make the LLIs (could/should we do this earlier??)
+ * slave (m/p) - no queued transactions allowed at present
+ *	TODO allow queued transactions for non circular buffers
+ * Set up the channel active txd as inactive
+ * m2m	- transactions may be queued
+ * If no active txd on channel
+ *	set it up as inactive
+ *	- issue_pending() will set active &amp; start
+ * else
+ *	queue it
+ * Lock channel since there may be (at least for m2m) multiple calls
+ *
+ * Return &lt; 0 for error
+ */
+static dma_cookie_t pl08x_tx_submit<co id="co.pl08x_tx_submit" linkends="co.note.pl08x_tx_submit" />(struct dma_async_tx_descriptor *tx)
+{
+	int num_llis;
+	unsigned long flags;
+	struct pl08x_txd *local_txd = container_of(tx, struct pl08x_txd, tx);
+	struct pl08x_dma_chan *local_chan =
+			container_of(tx-&gt;chan, struct pl08x_dma_chan, chan);
+	int pl08x_chan_num = local_chan-&gt;chan_id;
+	num_llis = <co id="co.fill_lls_for_desc" linkends="co.note.fill_lls_for_desc" />fill_LLIS_for_desc(local_txd, pl08x_chan_num);
+
+	if (num_llis) {
+		spin_lock_irqsave(&amp;local_chan-&gt;lock, flags);
+		atomic_inc(&amp;local_chan-&gt;last_issued);
+		tx-&gt;cookie = atomic_read(&amp;local_chan-&gt;last_issued);
+
+		if (local_chan-&gt;at) {
+
+			/*
+			 * If this device not using a circular buffer then
+			 * queue this new descriptor.
+			 * The descriptor for a circular buffer continues
+			 * to be used until the channel is freed
+			 */
+			if (local_txd-&gt;pcd-&gt;circular_buffer)
+				dev_err(&amp;pd.dmac-&gt;dev,
+					"%s - attempting to queue a circular buffer\n",
+						__func__);
+			else
+				list_add_tail(&amp;local_txd-&gt;txd_list,
+					&amp;local_chan-&gt;desc_list);
+
+		} else {
+			local_txd-&gt;slave = local_chan-&gt;slave;
+			local_chan-&gt;at = local_txd;
+			local_txd-&gt;active = 0;
+		}
+
+		spin_unlock_irqrestore(&amp;local_chan-&gt;lock, flags);
+
+		return tx-&gt;cookie;
+	} else
+		return -EINVAL;
+}
+        </programlisting>
+        <calloutlist>
+            <callout id="co.note.pl08x_tx_submit" arearefs="co.pl08x_tx_submit" >
+                <para>此submit函数是你之前准备好了一切后，最后调用此函数提交你的请求，但是实际并没开始真正的DMA传输，要等到最后的issue pending才真正开始</para>
+            </callout>
+            <callout id="co.note.fill_lls_for_desc" arearefs="co.fill_lls_for_desc" >
+                <para>为当前的desc描述符，填充好对应的LLI</para>
+            </callout>
+        </calloutlist>
+    </programlistingco>
+</sect1>
+
+<sect1><title>pl08x_prep_dma_memcpy</title>
+    <programlistingco>
+        <programlisting language="c" >
+/*
+ * Initialize a descriptor to be used by submit
+ */
+static struct dma_async_tx_descriptor *pl08x_prep_dma_memcpy<co id="co.pl08x_prep_dma_memcpy" linkends="co.note.pl08x_prep_dma_memcpy" />(
+		struct dma_chan *chan, dma_addr_t dest, dma_addr_t src,
+		size_t len, unsigned long flags)
+{
+	struct pl08x_txd *local_txd;
+	local_txd = kzalloc(sizeof(struct pl08x_txd), GFP_KERNEL);
+	if (!local_txd) {
+		dev_err(&amp;pd.dmac-&gt;dev,
+			"%s - no memory for descriptor\n", __func__);
+		return NULL;
+	} else {
+		dma_async_tx_descriptor_init(&amp;local_txd-&gt;tx, chan);
+		local_txd-&gt;srcbus.addr	= src;
+		local_txd-&gt;dstbus.addr	= dest;
+		local_txd-&gt;tx.tx_submit	= pl08x_tx_submit;
+		local_txd-&gt;len = len;
+		/*
+		 *  dmaengine.c has these directions hard coded,
+		 *  but not acessible
+		 */
+		local_txd-&gt;dstdir = DMA_FROM_DEVICE;
+		local_txd-&gt;srcdir = DMA_TO_DEVICE;
+		INIT_LIST_HEAD(&amp;local_txd-&gt;txd_list);
+		/*
+		 * Ensure the platform data for m2m is set on the channel
+		 */
+		local_txd-&gt;pcd = &amp;pd.pd-&gt;sd[PL08X_DMA_SIGNALS];
+	}
+	return &amp;local_txd-&gt;tx;
+}
+        </programlisting>
+        <calloutlist>
+            <callout id="co.note.pl08x_prep_dma_memcpy" arearefs="co.pl08x_prep_dma_memcpy" >
+                <para>为DMA的memcpy做一些准备工作，主要就是初始化一些参数，尤其是传输方向</para>
+            </callout>
+        </calloutlist>
+    </programlistingco>
+</sect1>
+
+<sect1><title>pl08x_prep_dma_interrupt</title>
+    <programlistingco>
+        <programlisting language="c" >
+static struct dma_async_tx_descriptor *pl08x_prep_dma_interrupt(
+		struct dma_chan *chan, unsigned long flags)
+{
+	struct dma_async_tx_descriptor *retval = NULL;
+	return retval;
+}
+        </programlisting>
+    </programlistingco>
+</sect1>
+
+<sect1><title>pl08x_dma_is_complete</title>
+    <programlistingco>
+        <programlisting language="c" >
+/*
+ * Code accessing dma_async_is_complete() in a tight loop
+ * may give problems - could schedule where indicated.
+ * If slaves are relying on interrupts to signal completion this
+ * function must not be called with interrupts disabled
+ */
+static enum dma_status pl08x_dma_is_complete<co id="co.pl08x_dma_is_complete" linkends="co.note.pl08x_dma_is_complete" />(struct dma_chan *chan,
+						dma_cookie_t cookie,
+						dma_cookie_t *done,
+						dma_cookie_t *used)
+{
+	struct pl08x_dma_chan *local_chan = container_of(chan,
+				struct pl08x_dma_chan, chan);
+	dma_cookie_t last_used;
+	dma_cookie_t last_complete;
+	enum dma_status ret;
+
+	last_used = atomic_read(&amp;local_chan-&gt;last_issued);
+	last_complete = local_chan-&gt;lc;
+
+	if (done)
+		*done = last_complete;
+	if (used)
+		*used = last_used;
+
+	ret = dma_async_is_complete(cookie, last_complete, last_used);
+	if (ret == DMA_SUCCESS)
+		return ret;
+
+	/*
+	 * schedule(); could be inserted here
+	 */
+
+	/*
+	 * This cookie not complete yet
+	 */
+	last_used = atomic_read(&amp;local_chan-&gt;last_issued);
+	last_complete = local_chan-&gt;lc;
+
+	if (done)
+		*done = last_complete;
+	if (used)
+		*used = last_used;
+
+	return dma_async_is_complete(cookie, last_complete, last_used);
+}
+        </programlisting>
+        <calloutlist>
+            <callout id="co.note.pl08x_dma_is_complete" arearefs="co.pl08x_dma_is_complete" >
+                <para>提供了一个函数，用于检测当前DMA是否已经完成了，实际好像很少用到，多数是用complete机制</para>
+            </callout>
+        </calloutlist>
+    </programlistingco>
+</sect1>
+
+<sect1><title>pl08x_issue_pending</title>
+    <programlistingco>
+        <programlisting language="c" >
+/*
+ * Slave transactions callback to the slave device to allow
+ * synchronization of slave DMA signals with the DMAC enable
+ */
+static void pl08x_issue_pending<co id="co.pl08x_issue_pending" linkends="co.note.pl08x_issue_pending" />(struct dma_chan *chan)
+{
+	struct pl08x_dma_chan *local_chan
+		= container_of(chan, struct pl08x_dma_chan, chan);
+	int pl08x_chan_num = local_chan-&gt;chan_id;
+
+	if (local_chan-&gt;at) {<co id="co.use_dma_when_idle" linkends="co.note.use_dma_when_idle" />
+		if (!local_chan-&gt;at-&gt;active) {
+			pl08x_set_cregs(local_chan-&gt;at, local_chan-&gt;chan_id);
+			if (local_chan-&gt;slave) {
+				/*
+				 * Allow slaves to activate signals
+				 * concurrent to the DMAC enable
+				 */
+				if (local_chan-&gt;at-&gt;tx.callback) {
+					((struct pl08x_callback_param *)
+						local_chan-&gt;at-&gt;tx.callback_param)-&gt;act =
+								PL08X_SIGNAL_START;
+					local_chan-&gt;at-&gt;tx.callback(
+						local_chan-&gt;at-&gt;tx.callback_param);
+				}
+			}
+			pl08x_enable_dmac_chan(local_chan-&gt;chan_id);
+			local_chan-&gt;at-&gt;active = 1;
+		}
+		/*
+		 * else skip active transfer
+		 * Calls with active txd occur for NET_DMA
+		 * - there can be queued descriptors
+		 */
+	}
+	/*
+	 * else - calls with no active descriptor occur for NET_DMA
+	 */
+}
+        </programlisting>
+        <calloutlist>
+            <callout id="co.note.pl08x_issue_pending" arearefs="co.pl08x_issue_pending" >
+                <para>真正的提交DMA请求，进行DMA传输的函数</para>
+            </callout>
+            <callout id="co.note.use_dma_when_idle" arearefs="co.use_dma_when_idle" >
+                <para>如果当前没人在用此channel，那么就可以真正去使用了，先去设置寄存器的值，然后通知client DMA开始了，最后真正的设置物理上的寄存器，开始DMA传输</para>
+            </callout>
+        </calloutlist>
+    </programlistingco>
+</sect1>
+
+
+<sect1><title>pl08x_prep_slave_sg</title>
+    <programlistingco>
+        <programlisting language="c" >
+struct dma_async_tx_descriptor *pl08x_prep_slave_sg<co id="co.pl08x_prep_slave_sg" linkends="co.note.pl08x_prep_slave_sg" />(
+		struct dma_chan *chan, struct scatterlist *sgl,
+		unsigned int sg_len, enum dma_data_direction direction,
+		unsigned long flags)
+{
+	struct pl08x_txd *local_txd;
+	unsigned int reg = 0;
+	int i;
+
+	/*
+	 * Current implementation ASSUMES only one sg
+	 */
+	if (sg_len != 1)
+		BUG();
+
+	local_txd = kmalloc(sizeof(struct pl08x_txd), GFP_KERNEL);
+	if (!local_txd)	{
+		dev_err(&amp;pd.dmac-&gt;dev, "%s - no local_txd\n", __func__);
+		return NULL;
+	} else {
+		struct pl08x_dma_chan *local_chan =
+			container_of(chan, struct pl08x_dma_chan, chan);
+
+		dma_async_tx_descriptor_init(&amp;local_txd-&gt;tx, chan);
+
+		if (direction == DMA_TO_DEVICE) {
+
+			local_txd-&gt;srcbus.addr	= sgl-&gt;dma_address;
+			local_txd-&gt;dstbus.addr	=
+				reg = local_chan-&gt;slave-&gt;tx_reg;
+
+		} else if (direction == DMA_FROM_DEVICE) {
+			local_txd-&gt;srcbus.addr	=
+				reg = local_chan-&gt;slave-&gt;rx_reg;
+			local_txd-&gt;dstbus.addr	= sgl-&gt;dma_address;
+		} else {
+			dev_err(&amp;pd.dmac-&gt;dev,
+				"%s - direction unsupported\n", __func__);
+			return NULL;
+		}
+		/*
+		 * Find the device array entry for this txd
+		 * so that the txd has access to the peripheral data
+		 */
+		for (i = 0; i &lt; PL08X_DMA_SIGNALS; i++) {
+			if (reg == (((unsigned int)(pd.pd-&gt;sd[i].io_addr))))<co id="co.check_equal_chan" linkends="co.note.check_equal_chan" />
+				break;
+		}
+		local_txd-&gt;pcd = &amp;pd.pd-&gt;sd[i];
+		local_txd-&gt;tx.tx_submit	= pl08x_tx_submit;
+		local_txd-&gt;len = sgl-&gt;length;
+		INIT_LIST_HEAD(&amp;local_txd-&gt;txd_list);
+	}
+
+	return &amp;local_txd-&gt;tx;
+}
+        </programlisting>
+        <calloutlist>
+            <callout id="co.note.pl08x_prep_slave_sg" arearefs="co.pl08x_prep_slave_sg" >
+                <para>上层程序调用此函数，对提出的DMA请求和scatter/gather list 信息进行预处理，其实主要就是根据你当前的一些参数，包括设备的DMA的地址进行匹配，找到合适的配置参数，用于以后的DMA各个参数的设置</para>
+            </callout>
+            <callout id="co.note.check_equal_chan" arearefs="co.check_equal_chan" >
+                <para>找到和自己的匹配的那个参数，这些参数是之前在amba设备注册时候，已经设置和初始化好的一堆设置参数</para>
+            </callout>
+        </calloutlist>
+    </programlistingco>
+</sect1>
+
+<sect1><title>pl08x_terminate_all</title>
+    <programlistingco>
+        <programlisting language="c" >
+/*
+ * CAUTION: Called by ALSA interrupt handler
+ */
+void pl08x_terminate_all<co id="co.pl08x_terminate_all" linkends="co.note.pl08x_terminate_all" />(struct dma_chan *chan)
+{
+	struct pl08x_dma_chan *local_chan =
+		container_of(chan, struct pl08x_dma_chan, chan);
+	int pl08x_chan_num = local_chan-&gt;chan_id;
+
+	if (local_chan-&gt;slave-&gt;dev) {
+		pl08x_disable_dmac_chan(pl08x_chan_num);
+		/*
+		 * Allow slaves to activate signals
+		 * concurrent to the DMAC enable
+		 */
+		if (local_chan-&gt;at) {
+			if (local_chan-&gt;at-&gt;tx.callback) {
+				((struct pl08x_callback_param *)
+					local_chan-&gt;at-&gt;tx.callback_param)
+						-&gt;act = PL08X_SIGNAL_STOP;
+
+				local_chan-&gt;at-&gt;tx.callback(
+					local_chan-&gt;at-&gt;tx.callback_param);
+			}
+		}
+	}
+}
+        </programlisting>
+        <calloutlist>
+            <callout id="co.note.pl08x_terminate_all" arearefs="co.pl08x_terminate_all" >
+                <para>结束所有的通道</para>
+            </callout>
+        </calloutlist>
+    </programlistingco>
+</sect1>
+
+</chapter>

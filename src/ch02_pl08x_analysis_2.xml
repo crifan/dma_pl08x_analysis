@@ -1,0 +1,1027 @@
+<?xml version='1.0' encoding="utf-8"?>
+
+<!DOCTYPE chapter>
+
+<chapter xmlns="http://docbook.org/ns/docbook"
+    xml:id="ch02_pl08x_analysis_2"
+    xmlns:xi="http://www.w3.org/2001/XInclude">
+
+<title>ARM的PL08X的代码的详细解析 第二部分</title>
+<abstract></abstract>
+
+<sect1><title>fill_LLIS_for_desc</title>
+    <programlistingco>
+        <programlisting language="c" >
+/*
+ * Note that we assume we never have to change the burst sizes
+ * Return 0 for error
+ */
+int fill_LLIS_for_desc(struct pl08x_txd *local_txd, int pl08x_chan_num)
+{
+	struct pl08x_clientdev_data *client = local_txd-&gt;pcd;
+	struct pl08x_bus_data *mbus, *sbus;
+	int remainder;
+	int num_llis = 0;
+	union _cctl cctl_parm;
+	int max_bytes_per_lli;
+	int total_bytes = 0;
+	struct _lli *llis_va;
+	struct _lli *llis_bus;
+
+	if (!local_txd) {
+		dev_err(&amp;pd.dmac-&gt;dev, "%s - no descriptor\n", __func__);
+		return 0;
+	}
+
+	/*
+	 * Get some LLIs
+	 *  This alloc can wait if the pool is used up so we need to cleanup
+	 */
+	local_txd-&gt;llis_va = dma_pool_alloc(pd.pool, GFP_KERNEL,
+					&amp;local_txd-&gt;llis_bus);
+	if (!local_txd-&gt;llis_va) {
+		dev_err(&amp;pd.dmac-&gt;dev, "%s - no llis\n", __func__);
+		return 0;
+	}
+
+	pd.pool_ctr++;
+
+	/*
+	 * Initialize bus values for this transfer
+	 * from the passed optimal values
+	 */
+	if (!client) {
+		dev_err(&amp;pd.dmac-&gt;dev, "%s - no client\n", __func__);
+		return 0;
+	}
+
+	cctl_parm.val = client-&gt;cctl_opt;
+	local_txd-&gt;srcbus.maxwidth =<co id="co.dec_out_widthbits" linkends="co.note.dec_out_widthbits" />
+		pl08x_decode_widthbits(cctl_parm.bits.swidth);
+
+	if (local_txd-&gt;srcbus.maxwidth == PL08X_CODING_ERR) {
+		dev_err(&amp;pd.dmac-&gt;dev,
+			"%s - local_txd-&gt;srcbus.maxwidth codeing error cctl_parm.bits.swidth %d\n",
+				__func__, cctl_parm.bits.swidth);
+		return 0;
+	}
+
+	local_txd-&gt;srcbus.buswidth = local_txd-&gt;srcbus.maxwidth;
+	local_txd-&gt;dstbus.maxwidth =
+		pl08x_decode_widthbits(cctl_parm.bits.dwidth);
+
+	if (local_txd-&gt;dstbus.maxwidth == PL08X_CODING_ERR) {
+		dev_err(&amp;pd.dmac-&gt;dev,
+			"%s - local_txd-&gt;dstbus.maxwidth coding error - cctl_parm.bits.dwidth %d\n",
+				__func__, cctl_parm.bits.dwidth);
+		return 0;
+	}
+
+	local_txd-&gt;dstbus.buswidth = local_txd-&gt;dstbus.maxwidth;
+
+	/*
+	 *  Note bytes transferred == tsize * MIN(buswidths), not max(buswidths)
+	 */
+	max_bytes_per_lli = <co id="co.srd_dst_choose_master" linkends="co.note.srd_dst_choose_master" />min(local_txd-&gt;srcbus.maxwidth,
+					local_txd-&gt;dstbus.maxwidth) *
+						cctl_parm.bits.tsize;
+
+	remainder = local_txd-&gt;len;
+	/*
+	 * Choose bus to align to
+	 * - prefers destination bus if both available
+	 * - if fixed address on one bus chooses other
+	 */
+	pl08x_choose_master_bus(&amp;local_txd-&gt;srcbus,
+		&amp;local_txd-&gt;dstbus, &amp;mbus, &amp;sbus, &amp;cctl_parm);
+
+	if (local_txd-&gt;len &lt; mbus-&gt;buswidth)<co id="co.split_lli_if_small" linkends="co.note.split_lli_if_small" /> {
+		/*
+		 * Less than a bus width available
+		 * - send as single bytes
+		 */
+		while (remainder) {
+			cctl_parm.bits.swidth = pl08x_encode_width(1);
+			cctl_parm.bits.dwidth = pl08x_encode_width(1);
+			cctl_parm.bits.tsize = 1;
+			num_llis =
+				pl08x_fill_lli_for_desc(local_txd, num_llis, 1,
+					&amp;cctl_parm, &amp;remainder);
+			total_bytes++;
+		}
+	} else {
+		/*
+		 *  Make one byte LLIs until master bus is aligned
+		 *  - slave will then be aligned also
+		 */
+		while ((mbus-&gt;addr) % (mbus-&gt;buswidth)) {
+			cctl_parm.bits.swidth = pl08x_encode_width(1);
+			cctl_parm.bits.dwidth = pl08x_encode_width(1);
+			cctl_parm.bits.tsize = 1;
+			num_llis = pl08x_fill_lli_for_desc
+				(local_txd, num_llis, 1, &amp;cctl_parm,
+					&amp;remainder);
+			total_bytes++;
+		}
+		/*
+		 *  Master now aligned
+		 * - if slave is not then we must set its width down
+		 */
+		if (sbus-&gt;addr % sbus-&gt;buswidth)
+			sbus-&gt;buswidth = 1;
+
+		/*
+		 * Make largest possible LLIs until less than one bus width left
+		 */
+		while (remainder &gt; (mbus-&gt;buswidth - 1)) {
+			int lli_len, target_len;
+			int tsize;
+			int odd_bytes;
+			/*
+			 * If enough left try to send max possible,
+			 * otherwise try to send the remainder
+			 */
+			target_len = remainder;
+			if (remainder &gt; max_bytes_per_lli)
+				target_len = max_bytes_per_lli;
+			/*
+			 *  Set bus lengths for incrementing busses
+			 *  to number of bytes which fill
+			 *  to next memory boundary
+			 */
+			if (cctl_parm.bits.si)
+				local_txd-&gt;srcbus.fill_bytes =
+					pl08x_pre_boundary(
+						local_txd-&gt;srcbus.addr,
+						remainder);<co id="co.do_bound_check" linkends="co.note.do_bound_check" />
+			else
+				local_txd-&gt;srcbus.fill_bytes =
+					max_bytes_per_lli;
+			if (cctl_parm.bits.di)
+				local_txd-&gt;dstbus.fill_bytes =
+					pl08x_pre_boundary(
+						local_txd-&gt;dstbus.addr,
+						remainder);
+			else
+				local_txd-&gt;dstbus.fill_bytes =
+						max_bytes_per_lli;
+			/*
+			 *  Find the nearest
+			 */
+			lli_len	= min(local_txd-&gt;srcbus.fill_bytes,
+						local_txd-&gt;dstbus.fill_bytes);
+
+			if (lli_len &lt;= 0) {
+				dev_err(&amp;pd.dmac-&gt;dev,
+					"%s - lli_len is %d, &lt;= 0\n",
+						__func__, lli_len);
+				return 0;
+			}
+
+			if (lli_len == target_len) {
+				/*
+				 * Can send what we wanted
+				 */
+				/*
+				 *  Maintain alignment
+				 */
+				lli_len	= (lli_len/mbus-&gt;buswidth) *
+							mbus-&gt;buswidth;
+				odd_bytes = 0;
+			} else {
+				/*
+				 * So now we know how many bytes to transfer
+				 * to get to the nearest boundary
+				 * The next lli will past the boundary
+				 * - however we may be working to a boundary
+				 *   on the slave bus
+				 *   We need to ensure the master stays aligned
+				 */
+				odd_bytes = lli_len % mbus-&gt;buswidth;
+				/*
+				 * - and that we are working in multiples
+				 *   of the bus widths
+				 */
+				lli_len -= odd_bytes;
+
+			}
+			if (lli_len) {
+				/*
+				 * Check against minimum bus alignment
+				 */
+				target_len = lli_len;
+				tsize = lli_len/min(mbus-&gt;buswidth,
+							sbus-&gt;buswidth);
+				lli_len	= tsize * min(mbus-&gt;buswidth,
+							sbus-&gt;buswidth);
+
+				if (target_len != lli_len) {
+					dev_err(&amp;pd.dmac-&gt;dev,
+					"%s - can't send what we want. Desired %d, sent %d in transfer of %d\n",
+					__func__, target_len, lli_len, local_txd-&gt;len);
+					return 0;
+				}
+
+				cctl_parm.bits.swidth = pl08x_encode_width
+					(local_txd-&gt;srcbus.buswidth);
+				cctl_parm.bits.dwidth = pl08x_encode_width
+					(local_txd-&gt;dstbus.buswidth);
+				if ((cctl_parm.bits.swidth == PL08X_CODING_ERR) ||
+					(cctl_parm.bits.dwidth == PL08X_CODING_ERR)) {
+					dev_err(&amp;pd.dmac-&gt;dev,
+					"%s - cctl_parm.bits.swidth or dwidth coding error - local_txd-&gt;dstbus.buswidth %d, local_txd-&gt;srcbus.buswidth %d\n",
+					__func__,
+					local_txd-&gt;dstbus.buswidth,
+					local_txd-&gt;srcbus.buswidth
+					);
+					return 0;
+				}
+				cctl_parm.bits.tsize = tsize;
+				num_llis = pl08x_fill_lli_for_desc(local_txd,
+						num_llis, lli_len, &amp;cctl_parm,
+						&amp;remainder);
+				total_bytes += lli_len;
+			}
+			if (odd_bytes) {
+				/*
+				 * Creep past the boundary,
+				 * maintaining master alignment
+				 */
+				int j;
+				for (j = 0; (j &lt; mbus-&gt;buswidth)
+						&amp;&amp; (remainder); j++) {
+					cctl_parm.bits.swidth =
+						pl08x_encode_width(1);
+					cctl_parm.bits.dwidth =
+						pl08x_encode_width(1);
+
+					cctl_parm.bits.tsize = 1;
+					num_llis =
+						pl08x_fill_lli_for_desc(
+							local_txd, num_llis, 1,
+							&amp;cctl_parm, &amp;remainder);
+					total_bytes++;
+				}
+			}
+		}
+
+		/*
+		 * Send any odd bytes
+		 */
+		if (remainder &lt; 0) {
+			dev_err(&amp;pd.dmac-&gt;dev, "%s - -ve remainder 0x%08x\n",
+					__func__, remainder);
+			return 0;
+		}
+
+		while (remainder) {
+			cctl_parm.bits.swidth = pl08x_encode_width(1);
+			cctl_parm.bits.dwidth = pl08x_encode_width(1);
+			cctl_parm.bits.tsize = 1;
+			num_llis = pl08x_fill_lli_for_desc(local_txd, num_llis,
+					1, &amp;cctl_parm, &amp;remainder);
+			total_bytes++;
+		}
+	}
+	if (total_bytes != local_txd-&gt;len) {
+		dev_err(&amp;pd.dmac-&gt;dev,
+			"%s - only transferred 0x%08x from size 0x%08x\n",
+				__func__, total_bytes, local_txd-&gt;len);
+		return 0;
+	}
+
+	if (num_llis &gt;= MAX_NUM_TSFR_LLIS) {<co id="co.split_many_lli" linkends="co.note.split_many_lli" />
+		dev_err(&amp;pd.dmac-&gt;dev,
+			"%s - need to increase MAX_NUM_TSFR_LLIS from 0x%08x\n",
+				__func__, MAX_NUM_TSFR_LLIS);
+		return 0;
+	}
+	/*
+	 * Decide whether this is a loop or a terminated transfer
+	 */
+	llis_va = ((struct _lli *)local_txd-&gt;llis_va);
+	llis_bus = ((struct _lli *)local_txd-&gt;llis_bus);
+
+	if (client-&gt;circular_buffer) {<co id="co.circular_buffer" linkends="co.note.circular_buffer" />
+		llis_va[num_llis - 1].next =
+			(dma_addr_t)((unsigned int)&amp;(llis_bus[0]) +
+						pd.pd-&gt;bus_bit_lli);
+	} else {
+		/*
+		 * Final LLI terminates
+		 */
+
+		llis_va[num_llis - 1].next = 0;<co id="co.final_lli" linkends="co.note.final_lli" />
+		/*
+		 * Final LLI interrupts
+		 */
+		llis_va[num_llis - 1].cctl.bits.intr = PL08X_CCTL_INTR_YES;<co id="co.dma_intr" linkends="co.note.dma_intr" />
+	}
+
+	/* Now store the channel register values */
+	local_txd-&gt;csrc = llis_va[0].src;
+	local_txd-&gt;cdst = llis_va[0].dst;
+	if (num_llis &gt; 1)
+		local_txd-&gt;clli = llis_va[0].next;
+	else
+		local_txd-&gt;clli = 0;
+
+	local_txd-&gt;cctl = llis_va[0].cctl.val;
+	local_txd-&gt;ccfg = client-&gt;config_base;
+
+	/*
+	 * TODO: Change to use /proc data
+	 */
+	if (pd.max_num_llis &lt; num_llis)
+		pd.max_num_llis = num_llis;
+
+	return num_llis;
+}
+        </programlisting>
+        <calloutlist>
+            <callout id="co.note.dec_out_widthbits" arearefs="co.dec_out_widthbits" >
+                <para>从传入的配置中，解码出bus宽度，单位字节</para>
+            </callout>
+            <callout id="co.note.srd_dst_choose_master" arearefs="co.srd_dst_choose_master" >
+                <para>从源总线和目的总线选出一个最小带宽，然后乘与一个传输的个数，得到单个LLI的最大允许的字节数</para>
+            </callout>
+            <callout id="co.note.split_lli_if_small" arearefs="co.split_lli_if_small" >
+                <para>要传输的数据，比带宽还小，那简单地分成几个LLI就搞定了</para>
+            </callout>
+            <callout id="co.note.do_bound_check" arearefs="co.do_bound_check" >
+                <para>检查数据有没有超过允许的范围，如果超过了，就用PL08X_BOUNDARY_SIZE=0x400=1KB</para>
+            </callout>
+            <callout id="co.note.split_many_lli" arearefs="co.split_many_lli" >
+                <para>如果你一次要求传输数据太多，然后拆分成了太多个LLI，那么这里会告诉你超过限制了</para>
+            </callout>
+            <callout id="co.note.circular_buffer" arearefs="co.circular_buffer" >
+                <para>如果是循环缓存circular buffer，那么就告诉DMA传完最后一个LLI的时候，继续从最这个LLI的链表的最开始一个传，这样就周而复始地传输了，一般适用于音频流数据</para>
+            </callout>
+            <callout id="co.note.final_lli" arearefs="co.final_lli" >
+                <para>最后一个LLI的next LLI指针的值，一定要设置为NULL，表示DMA传输完这个LLI之后，就结束了</para>
+            </callout>
+            <callout id="co.note.dma_intr" arearefs="co.dma_intr" >
+                <para>最后DMA传完所有的数据了，肯定要发生中断，然后此出pl08x的irq函数会被调用，然后会再接着调用你的驱动做DMA请求时候挂载的callback函数</para>
+            </callout>
+        </calloutlist>
+    </programlistingco>
+</sect1>
+
+<sect1><title>pl08x_set_cregs</title>
+    <programlistingco>
+        <programlisting language="c" >
+/*
+ * Set the initial DMA register values i.e. those for the first LLI
+ * The next lli pointer and the configuration interrupt bit have
+ * been set when the LLIs were constructed
+ */
+void pl08x_set_cregs(struct pl08x_txd *entry, int pl08x_chan_num)
+{
+	unsigned int reg;
+	unsigned int chan_base<co id="co.calc_base" linkends="co.note.calc_base" /> = (unsigned int)pd.base
+					+ PL08X_OS_CHAN_BASE;
+	chan_base += pl08x_chan_num * PL08X_OS_CHAN;
+
+	/* Wait for channel inactive */<co id="co.wait_inactive" linkends="co.note.wait_inactive" />
+	reg = readl(chan_base + PL08X_OS_CCFG);
+	while (reg &amp; PL08X_MASK_ACTIVE)
+		reg = readl(chan_base + PL08X_OS_CCFG);
+
+	writel(entry-&gt;csrc, chan_base + PL08X_OS_CSRC);
+	writel(entry-&gt;cdst, chan_base + PL08X_OS_CDST);
+	writel(entry-&gt;clli, chan_base + PL08X_OS_CLLI);
+	writel(entry-&gt;cctl, chan_base + PL08X_OS_CCTL);
+	writel(entry-&gt;ccfg, chan_base + PL08X_OS_CCFG);
+	mb();
+}
+        </programlisting>
+        <calloutlist>
+            <callout id="co.note.calc_base" arearefs="co.calc_base" >
+                <para>找到当前使用的channel的基地址</para>
+            </callout>
+            <callout id="co.note.wait_inactive" arearefs="co.wait_inactive" >
+                <para>如果之前正有人用此channel的DMA，就等待直到不在用，即inactive为止</para>
+                <para>注意，此处没有直接去Halt或者disable对应的channel，因为有可能之前的某个DMA正在传输过程中，所以应该等待其完成，当然，大多数情况都是已经是inactive了</para>
+            </callout>
+        </calloutlist>
+    </programlistingco>
+</sect1>
+
+<sect1><title>pl08x_memrelease</title>
+    <programlistingco>
+        <programlisting language="c" >
+/*
+ *  Might take too long to do all at once
+ *  if so - free some then hand it off
+ */
+void pl08x_memrelease<co id="co.release_mem" linkends="co.note.release_mem" />(void)
+{
+	struct pl08x_txd *local_txd, *next;
+	unsigned long flags;
+	int chan;
+
+	for (chan = 0; chan &lt; MAX_DMA_CHANNELS; chan++) {
+
+		list_for_each_entry_safe(local_txd, next, &amp;pd.chanwrap[chan]-&gt;release_list, txd_list)
+		{
+			spin_lock_irqsave(&amp;pd.lock, flags);
+			if (!local_txd)
+				dev_err(&amp;pd.dmac-&gt;dev,
+					"%s - no descriptor\n",	__func__);
+
+			if (local_txd-&gt;tx.callback) {
+				((struct pl08x_callback_param *)
+					local_txd-&gt;tx.callback_param)-&gt;act =
+						PL08X_RELEASE;
+				local_txd-&gt;tx.callback(
+					local_txd-&gt;tx.callback_param);
+			}
+
+			list_del(&amp;local_txd-&gt;txd_list);
+			dma_pool_free(pd.pool, local_txd-&gt;llis_va,
+				local_txd-&gt;llis_bus);
+
+			/*
+			 * p/m data not mapped - uses coherent or io mem
+			 */
+			if (!local_txd-&gt;slave) {
+				dma_unmap_single(dmac.dev,
+					local_txd-&gt;srcbus.addr, local_txd-&gt;len,
+						local_txd-&gt;srcdir);
+
+				dma_unmap_single(dmac.dev,
+					local_txd-&gt;dstbus.addr, local_txd-&gt;len,
+						local_txd-&gt;dstdir);
+			}
+			kfree(local_txd);
+			spin_unlock_irqrestore(&amp;pd.lock, flags);
+		}
+	}
+	pd.pool_ctr = 0;
+}
+        </programlisting>
+        <calloutlist>
+            <callout id="co.note.release_mem" arearefs="co.release_mem" >
+                <para>释放DMA内存</para>
+            </callout>
+        </calloutlist>
+    </programlistingco>
+</sect1>
+
+<sect1><title>pl08x_disable_dmac_chan</title>
+    <programlistingco>
+        <programlisting language="c" >
+/*
+ * Overall DMAC remains enabled always.
+ *
+ * Disabling individual channels could lose data.
+ *
+ * Disable the peripheral DMA after disabling the DMAC
+ * in order to allow the DMAC FIFO to drain, and
+ * hence allow the channel to show inactive
+ *
+ */
+void pl08x_disable_dmac_chan(unsigned int ci)
+{
+	unsigned int reg;
+	unsigned int chan_base = (unsigned int)pd.base
+					+ PL08X_OS_CHAN_BASE;
+
+	chan_base += ci * PL08X_OS_CHAN;
+
+	/*
+	 * Ignore subsequent requests
+	 */
+	reg = readl(chan_base + PL08X_OS_CCFG);
+	reg |= PL08X_MASK_HALT;
+	writel(reg, chan_base + PL08X_OS_CCFG);
+    <co id="co.halt_then_wait" linkends="co.note.halt_then_wait" />
+	/* Wait for channel inactive */
+	reg = readl(chan_base + PL08X_OS_CCFG);
+	while (reg &amp; PL08X_MASK_ACTIVE)
+		reg = readl(chan_base + PL08X_OS_CCFG);
+
+	reg = readl(chan_base + PL08X_OS_CCFG);
+	reg &amp;= ~PL08X_MASK_CEN;
+
+	writel(reg, chan_base + PL08X_OS_CCFG);
+	mb();
+
+	return;
+}
+        </programlisting>
+        <calloutlist>
+            <callout id="co.note.halt_then_wait" arearefs="co.halt_then_wait" >
+                <para>此处对于disable一个DMA的channel的做法，是根据datasheet中的描述：</para>
+                <quote>
+                    <para>Disabling a DMA channel without losing data in the FIFO</para>
+                    <para>To disable a DMA channel without losing data in the FIFO:</para>
+                    <orderedlist>
+                        <listitem>Set the Halt bit in the relevant channel Configuration Register. See Channel Configuration Registers on page 3-27. This causes any subsequent DMA requests to be ignored</listitem>
+                        <listitem> Poll the Active bit in the relevant channel Configuration Register until it reaches 0. This bit indicates whether there is any data in the channel that has to be transferred</listitem>
+                        <listitem>Clear the Channel Enable bit in the relevant channel Configuration Register</listitem>
+                    </orderedlist>
+                </quote>
+                <para>即先设置Halt位，然后一直轮询检测对应channel，直到inactive，然后再清空对应的Channel Enable位，如果直接不做任何检测判断，上来就去清空对应的Enable位，那么就会“losing data in the FIFO ”，丢失了FIFO中的数据，是不太安全的</para>
+            </callout>
+        </calloutlist>
+    </programlistingco>
+</sect1>
+
+<sect1><title>pl08x_enable_dmac_chan</title>
+    <programlistingco>
+        <programlisting language="c" >
+/*
+ * Enable the DMA channel
+ * ASSUMES All other configuration bits have been set
+ *         as desired before this code is called
+ */
+void pl08x_enable_dmac_chan(unsigned int cnum)
+{
+	void __iomem *cbase = pd.base + PL08X_OS_CHAN_BASE +
+					(cnum * PL08X_OS_CHAN);
+
+	unsigned int r = 0;
+	/*
+	 * Do not access config register until channel shows as disabled
+	 */
+	while ((readl(pd.base + PL08X_OS_ENCHNS)<co id="co.wait_until_disable" linkends="co.note.wait_until_disable" /> &amp; (1 &lt;&lt; cnum))
+			&amp; PL08X_MASK_ENCHNS);
+
+	/*
+	 * Do not access config register until channel shows as inactive
+	 */
+	r = readl(cbase + PL08X_OS_CCFG);
+	while ((r &amp; PL08X_MASK_ACTIVE)<co id="co.wait_until_inactive" linkends="co.note.wait_until_inactive" /> || (r &amp; PL08X_MASK_CEN))
+		r = readl(cbase + PL08X_OS_CCFG);
+
+	writel(r | PL08X_MASK_CEN, cbase + PL08X_OS_CCFG);
+	mb();
+}
+        </programlisting>
+        <calloutlist>
+            <callout id="co.note.wait_until_disable" arearefs="co.wait_until_disable" >
+                <para>等到对应channel是disable状态了，再接下来去enable它，会更安全</para>
+            </callout>
+            <callout id="co.note.wait_until_inactive" arearefs="co.wait_until_inactive" >
+                <para>等到对应channel是inactive状态了，再接下来去enable它，会更安全</para>
+            </callout>
+        </calloutlist>
+    </programlistingco>
+</sect1>
+
+<sect1><title>pl08x_dma_busy</title>
+    <programlistingco>
+        <programlisting language="c" >
+static int pl08x_dma_busy<co id="co.pl08x_dma_busy" linkends="co.note.pl08x_dma_busy" />(dmach_t ci)
+{
+	unsigned int reg;
+	unsigned int chan_base = (unsigned int)pd.base
+					+ PL08X_OS_CHAN_BASE;
+
+	chan_base += ci * PL08X_OS_CHAN;
+
+	/*
+	 * Check channel is inactive
+	 */
+	reg = readl(chan_base + PL08X_OS_CCFG);
+
+	return reg &amp; PL08X_MASK_ACTIVE;
+}
+        </programlisting>
+        <calloutlist>
+            <callout id="co.note.pl08x_dma_busy" arearefs="co.pl08x_dma_busy" >
+                <para>检测对应的位，得到是否是active的状态，对应着是否是busy</para>
+            </callout>
+        </calloutlist>
+    </programlistingco>
+</sect1>
+
+<sect1><title>pl08x_wqfunc</title>
+    <programlistingco>
+        <programlisting language="c" >
+/*
+ * Function for the shared work queue
+ * - scheduled by the interrupt handler when sufficient
+ *   list entries need releasing
+ */
+void pl08x_wqfunc(struct work_struct *work)
+{
+	if (pd.pd)
+		pl08x_memrelease();
+}
+        </programlisting>
+    </programlistingco>
+</sect1>
+
+<sect1><title>pl08x_amba_driver</title>
+    <programlistingco>
+        <programlisting language="c" >
+static struct amba_id pl08x_ids[] = {
+	/* PL080 */
+	{
+		.id	= 0x00041080<co id="co.pl080_id" linkends="co.note.pl080_id" />,
+		.mask	= 0x000fffff,
+	},
+	/* PL081 */
+	{
+		.id	= 0x00041081<co id="co.pl081_id" linkends="co.note.pl081_id" />,
+		.mask	= 0x000fffff,
+	},
+	{ 0, 0 },
+};
+
+#define DRIVER_NAME	"pl08xdmac"
+
+static int pl08x_probe(struct amba_device *amba_dev, void *id);
+
+static struct amba_driver pl08x_amba_driver = {
+	.drv.name	= "pl08xdmaapi",
+	.id_table	= pl08x_ids,
+	.probe		= pl08x_probe,
+};
+        </programlisting>
+        <calloutlist>
+            <callout id="co.note.pl080_id" arearefs="co.pl080_id" >
+                <para>PL080对应的设备ID是0x00041080详情参看Datasheet的"3.4.16 Peripheral Identification Registers 0-3"和"3.4.17 PrimeCell Identification Registers 0-3"</para>
+            </callout>
+            <callout id="co.note.pl081_id" arearefs="co.pl081_id" >
+                <para>PL081对应的设备ID是0x00041081详情参看Datasheet的"3.4.16 Peripheral Identification Registers 0-3"和"3.4.17 PrimeCell Identification Registers 0-3"</para>
+            </callout>
+        </calloutlist>
+    </programlistingco>
+</sect1>
+
+<sect1><title>pl08x_make_LLIs</title>
+    <programlistingco>
+        <programlisting language="c" >
+/*
+ * This single pool easier to manage than one pool per channel
+ */
+int pl08x_make_LLIs(void)
+{
+	int ret = 0;
+
+	/*
+	 * Make a pool of LLI buffers
+	 */
+	pd.pool	= dma_pool_create(pl08x_amba_driver.drv.name, &amp;pd.dmac-&gt;dev,
+			PL08X_LLI_TSFR_SIZE, PL08X_ALIGN, PL08X_ALLOC);
+	if (!pd.pool) {
+		ret = -ENOMEM;
+		kfree(pd.chanllis);
+	}
+	pd.pool_ctr = 0;
+	return ret;
+}
+        </programlisting>
+        <note>
+            <para>需要提到一点的是，如果你的驱动在初始化的时候，设置了下图：</para>
+            <figure id="fg.config_reg_bits"><title>配置寄存器的含义</title>
+                <mediaobject>
+                    <imageobject role="html">
+                        <imagedata fileref="images/config_reg_bits.png" align="left" scalefit="0" width="100%" />
+                    </imageobject>
+                    <imageobject role="fo">
+                        <imagedata fileref="images/config_reg_bits.png" align="center" scalefit="1" width="100%"/>
+                    </imageobject>
+                </mediaobject>
+            </figure>
+            <para>中的config寄存器中的ITC位，即终止计数中断，那么就会在每一个LLI传完之后就调用下面的这个pl08x_irq中断函数，如果没有设置ITC，而只是对最有一个LLI的ITC 设置了，那么就是所有的传输完成了，才会调用下面的pl08x_irq中断函数了</para>
+        </note>
+    </programlistingco>
+</sect1>
+
+<sect1><title>pl08x_irq</title>
+    <programlistingco>
+        <programlisting language="c" >
+/*
+ * issue pending() will start the next transfer
+ * - it only need be loaded here
+ * CAUTION the work queue function may run during the handler
+ * CAUTION function callbacks may have interesting side effects
+ */
+static irqreturn_t pl08x_irq(int irq, void *dev)
+{
+	u32 mask = 0;
+	u32 reg;
+	unsigned long flags;
+	int c;
+	reg = readl(pd.base + PL08X_OS_ISR_ERR);
+	mb();
+	if (reg) {
+		/*
+		 * An error interrupt (on one or more channels)
+		 */
+		dev_err(&amp;pd.dmac-&gt;dev,
+			"%s - Error interrupt, register value 0x%08x\n",
+				__func__, reg);
+		/*
+		 * Simply clear ALL PL08X error interrupts,<co id="co.when_irq_err" linkends="co.note.when_irq_err" />
+		 * regardless of channel and cause
+		 */
+		writel(0x000000FF, pd.base + PL08X_OS_ICLR_ERR);
+	}
+	reg = readl(pd.base + PL08X_OS_ISR);
+	mb();
+	for (c = 0; c &lt; MAX_DMA_CHANNELS; c++) {
+		if ((1 &lt;&lt; c) &amp; reg) {
+			struct pl08x_txd *entry = NULL;
+			struct pl08x_txd *next;
+
+			spin_lock_irqsave(&amp;pd.chanwrap[c]-&gt;lock, flags);
+
+			if (pd.chanwrap[c]-&gt;at) {
+				/*
+				 * Update last completed
+				 */
+				pd.chanwrap[c]-&gt;lc =
+					(pd.chanwrap[c]-&gt;at-&gt;tx.cookie);
+				/*
+				 * Callback peripheral driver for p/m
+				 * to signal completion
+				 */
+				if (pd.chanwrap[c]-&gt;at-&gt;tx.callback) {
+					/*
+					 * Pass channel number
+					 */
+					((struct pl08x_callback_param *)
+						pd.chanwrap[c]-&gt;at-&gt;tx.callback_param)-&gt;act = c;
+					pd.chanwrap[c]-&gt;at-&gt;tx.callback<co id="co.do_callback" linkends="co.note.do_callback" />(
+						pd.chanwrap[c]-&gt;at-&gt;tx.callback_param);
+				}
+				/*
+				 * Device callbacks should NOT clear
+				 * the current transaction on the channel
+				 */
+				if (!pd.chanwrap[c]-&gt;at)
+					BUG();
+
+				/*
+				 * Free the descriptor if it's not for a device
+				 * using a circular buffer
+				 */
+				if (!(pd.chanwrap[c]-&gt;at-&gt;pcd-&gt;circular_buffer)) {
+					list_add_tail(&amp;pd.chanwrap[c]-&gt;at-&gt;txd_list,
+						&amp;pd.chanwrap[c]-&gt;release_list);
+					pd.chanwrap[c]-&gt;at = NULL;
+					if (pd.pool_ctr &gt; PL08X_MAX_ALLOCS) {
+						schedule_work(&amp;pd.dwork);
+					}
+				}
+				/*
+				 * else descriptor for circular
+				 * buffers only freed when
+				 * client has disabled dma
+				 */
+			}
+			/*
+			 * If descriptor queued, set it up
+			 */
+			if (!list_empty(&amp;pd.chanwrap[c]-&gt;desc_list)) {
+				list_for_each_entry_safe(entry,
+				next, &amp;pd.chanwrap[c]-&gt;desc_list, txd_list) {
+					list_del_init(&amp;entry-&gt;txd_list);
+					pd.chanwrap[c]-&gt;at = entry;
+					break;
+				}
+			}
+
+			spin_unlock_irqrestore(&amp;pd.chanwrap[c]-&gt;lock, flags);
+
+			mask |= (1 &lt;&lt; c);
+		}
+	}
+	/*
+	 * Clear only the terminal interrupts on channels we processed
+	 */
+	writel(mask, pd.base + PL08X_OS_ICLR_TC);
+	mb();
+
+	return mask ? IRQ_HANDLED : IRQ_NONE;
+}
+        </programlisting>
+        <calloutlist>
+            <callout id="co.note.when_irq_err" arearefs="co.when_irq_err" >
+                <para>如果发现有任何错误，就退出</para>
+                <para>实际上此处很多种错误，而目前的此版本的驱动，暂时没加入更多的判断，仅仅是报错而已</para>
+            </callout>
+            <callout id="co.note.do_callback" arearefs="co.do_callback" >
+                <para>此处，真正去调用你之前挂载的callback函数，在callback函数里面，常见要做的事情就是清除你设备的DMA enable位，然后调用complete去使得completion变量完成，使得你驱动得以继续执行</para>
+            </callout>
+        </calloutlist>
+    </programlistingco>
+</sect1>
+
+<sect1><title>pl08x_ensure_on</title>
+    <programlistingco>
+        <programlisting language="c" >
+static void pl08x_ensure_on<co id="co.pl08x_ensure_on" linkends="co.note.pl08x_ensure_on" />(void){
+	unsigned int reg;
+
+	reg = readl(pd.base + PL08X_OS_CFG);
+	reg &amp;= PL08X_MASK_CFG;
+	reg |= PL08X_MASK_EN;
+	mb();
+	writel(reg, pd.base + PL08X_OS_CFG);
+	mb();
+}
+        </programlisting>
+        <calloutlist>
+            <callout id="co.note.pl08x_ensure_on" arearefs="co.pl08x_ensure_on" >
+                <para>全局性地Enable PL08x</para>
+            </callout>
+        </calloutlist>
+    </programlistingco>
+</sect1>
+
+<sect1><title>pl08x_dma_enumerate_channels</title>
+    <programlistingco>
+        <programlisting language="c" >
+/*
+ * Initialise the DMAC channels.
+ * Make a local wrapper to hold required data
+ */
+static int pl08x_dma_enumerate_channels<co id="co.pl08x_dma_enumerate_channels" linkends="co.note.pl08x_dma_enumerate_channels" />(void)
+{
+	int dma_chan;
+	struct pl08x_dma_chan *local_chan;
+
+	dma_cap_set(DMA_MEMCPY, dmac.cap_mask);
+	dma_cap_set(DMA_SLAVE, dmac.cap_mask);
+	if (dmac.chancnt)
+		dev_err(&amp;pd.dmac-&gt;dev, "%s - chancnt already set\n", __func__);
+	INIT_LIST_HEAD(&amp;dmac.channels);
+
+	for (dma_chan = 0; dma_chan &lt; MAX_DMA_CHANNELS; dma_chan++) {
+
+		local_chan = kzalloc(sizeof(struct pl08x_dma_chan),
+					GFP_KERNEL);
+		if (!local_chan) {
+			dev_err(&amp;pd.dmac-&gt;dev,
+				"%s - no memory for channel\n", __func__);
+			return dmac.chancnt;
+		}
+
+		/*
+		 * Save the DMAC channel number
+		 * to indicate which registers to access
+		 */
+		local_chan-&gt;chan_id = dma_chan;
+		local_chan-&gt;chan.device = &amp;dmac;
+		atomic_set(&amp;local_chan-&gt;last_issued, 0);
+		local_chan-&gt;lc = atomic_read(&amp;local_chan-&gt;last_issued);
+		if (pd.pd-&gt;reserved_for_slave)
+			local_chan-&gt;slave_only = pd.pd-&gt;reserved_for_slave(dma_chan);
+		else
+			dev_err(&amp;pd.dmac-&gt;dev,
+				"%s - can't establish channels reserved for slaves\n",
+					__func__);
+
+		spin_lock_init(&amp;local_chan-&gt;lock);
+		INIT_LIST_HEAD(&amp;local_chan-&gt;desc_list);
+		INIT_LIST_HEAD(&amp;local_chan-&gt;release_list);
+
+		list_add_tail(&amp;local_chan-&gt;chan.device_node, &amp;dmac.channels);
+
+		pd.chanwrap[dmac.chancnt++] = local_chan;
+	}
+
+	return dmac.chancnt;
+}
+        </programlisting>
+        <calloutlist>
+            <callout id="co.note.pl08x_dma_enumerate_channels" arearefs="co.pl08x_dma_enumerate_channels" >
+                <para>为目前支持的多个channel进行必要的初始化，包括申请空间，设置初始值</para>
+            </callout>
+        </calloutlist>
+    </programlistingco>
+</sect1>
+
+<sect1><title>pl08x_probe</title>
+    <programlistingco>
+        <programlisting language="c" >
+static int pl08x_probe<co id="co.pl08x_probe" linkends="co.note.pl08x_probe" />(struct amba_device *amba_dev, void *id)
+{
+	int ret = 0;
+
+	ret = pl08x_make_LLIs();<co id="co.alloc_lli" linkends="co.note.alloc_lli" />
+	if (ret)
+		return -ENOMEM;
+
+	ret = amba_request_regions<co id="co.amba_request_regions" linkends="co.note.amba_request_regions" />(amba_dev, NULL);
+	if (ret)
+		return ret;
+
+	pd.max_num_llis = 0;
+
+	/*
+	 * We have our own work queue for cleaning memory
+	 */
+	INIT_WORK(&amp;pd.dwork, pl08x_wqfunc);
+	pd.waitq = kmalloc(sizeof(wait_queue_head_t), GFP_KERNEL);
+	init_waitqueue_head(pd.waitq);
+
+	spin_lock_init(&amp;pd.lock);
+
+	pd.base = ioremap(amba_dev-&gt;res.start, SZ_4K);
+	if (!pd.base) {
+		ret = -ENOMEM;
+		goto out1;
+	}
+	/*
+	 * Attach the interrupt handler
+	 */
+	writel(0x000000FF, pd.base + PL08X_OS_ICLR_ERR);
+	writel(0x000000FF, pd.base + PL08X_OS_ICLR_TC);
+	mb();
+
+	ret = request_irq(amba_dev-&gt;irq[0], pl08x_irq, IRQF_DISABLED,
+			DRIVER_NAME, &amp;amba_dev-&gt;dev);
+	if (ret) {
+		dev_err(&amp;pd.dmac-&gt;dev, "%s - Failed to attach interrupt %d\n",
+				__func__, amba_dev-&gt;irq[0]);
+		goto out2;
+	}
+	/*
+	 * Data exchange
+	 */
+	pd.dmac = amba_dev;
+	amba_set_drvdata(amba_dev, &amp;pd);
+	pd.pd = (struct pl08x_platform_data *)(amba_dev-&gt;dev.platform_data);
+	/*
+	 * Negotiate for channels with the platform
+	 * and its DMA requirements
+	 */
+	dmac.dev = &amp;amba_dev-&gt;dev;
+
+	ret = pl08x_dma_enumerate_channels();
+
+	if (!ret) {
+		dev_warn(&amp;pd.dmac-&gt;dev,
+			"%s - failed to enumerate channels - %d\n",
+				__func__, ret);
+		goto out2;
+	} else {
+		ret = dma_async_device_register<co id="co.reg_dma_async" linkends="co.note.reg_dma_async" />(&amp;dmac);
+		if (ret) {
+			dev_warn(&amp;pd.dmac-&gt;dev,
+				"%s - failed to register as an async device - %d\n",
+					__func__, ret);
+			goto out2;
+		}
+	}
+	pl08x_ensure_on();<co id="co.ensure_dma_on" linkends="co.note.ensure_dma_on" />
+	dev_info(&amp;pd.dmac-&gt;dev,
+		"%s - ARM(R) PL08X DMA driver found\n",
+			__func__);
+
+	goto out;
+out2:
+	iounmap(pd.base);
+out1:
+	amba_release_regions(amba_dev);
+out:
+	return ret;
+}
+        </programlisting>
+        <calloutlist>
+            <callout id="co.note.pl08x_probe" arearefs="co.pl08x_probe" >
+                <para>经典的probe函数，对驱动进行必要的软件和硬件的初始化</para>
+            </callout>
+            <callout id="co.note.alloc_lli" arearefs="co.alloc_lli" >
+                <para>为后面要用到的LLI申请空间</para>
+            </callout>
+            <callout id="co.note.amba_request_regions" arearefs="co.amba_request_regions" >
+                <para>获得自己资源，其是你开始进行amba设备注册时候的，已经初始化好的对应的资源，包括基地址，中断号等</para>
+            </callout>
+            <callout id="co.note.reg_dma_async" arearefs="co.reg_dma_async" >
+                <para>将自己这个pl08x的DMA驱动，注册到DMA Engine 框架中</para>
+                <para>别处看到某人评论说是这个DMA Engine驱动框架属于老的了，有更好的新的，不了解，有空去看看</para>
+            </callout>
+            <callout id="co.note.ensure_dma_on" arearefs="co.ensure_dma_on" >
+                <para>硬件上确保启动DMA了</para>
+            </callout>
+        </calloutlist>
+    </programlistingco>
+</sect1>
+
+<sect1><title>pl08x_init</title>
+    <programlistingco>
+        <programlisting language="c" >
+static int __init pl08x_init(void)
+{
+	int retval;
+	retval = amba_driver_register(&amp;pl08x_amba_driver);
+	if (retval)
+		printk(KERN_WARNING
+			"PL08X::pl08x_init() - failed to register as an amba device - %d\n",
+				retval);
+	return retval;
+}
+device_initcall(pl08x_init);
+        </programlisting>
+    </programlistingco>
+</sect1>
+
+</chapter>

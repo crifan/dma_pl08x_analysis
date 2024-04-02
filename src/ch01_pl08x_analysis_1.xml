@@ -1,0 +1,754 @@
+<?xml version='1.0' encoding="utf-8"?>
+
+<!DOCTYPE chapter>
+
+<chapter xmlns="http://docbook.org/ns/docbook"
+    xml:id="ch01_pl08x_analysis_1"
+    xmlns:xi="http://www.w3.org/2001/XInclude">
+
+<title>ARM的PL08X的代码的详细解析 第一部分</title>
+<abstract></abstract>
+
+<sect1 xml:id="pl08x_doc"><title>PL08X Documentation</title>
+    <programlistingco>
+        <programlisting language="c" >
+/* Copyright(c) 2006 ARM Ltd.
+ *
+ * This program is free software; you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License as published by the Free
+ * Software Foundation; either version 2 of the License, or (at your option)
+ * any later version.
+ *
+ * This program is distributed in the hope that it will be useful, but WITHOUT
+ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License for
+ * more details.
+ *
+ * You should have received a copy of the GNU General Public License along with
+ * this program; if not, write to the Free Software Foundation, Inc., 59
+ * Temple Place - Suite 330, Boston, MA  02111-1307, USA.
+ *
+ * The full GNU General Public License is iin this distribution in the
+ * file called COPYING.
+ *
+ * Documentation: ARM DDI 0196G<co id="co.pl080_ds" linkends="co.note.pl080_ds" /> == PL080<co id="co.doc_pl080" linkends="co.note.doc_pl080" />
+ * Documentation: ARM DDI 0218E	== PL081<co id="co.doc_pl081" linkends="co.note.doc_pl081" />
+*
+ */
+        </programlisting>
+        <calloutlist>
+            <callout id="co.note.pl080_ds" arearefs="co.pl080_ds" >
+                <para>用DDI0196表示此pl08x.c dma驱动对应的datasheet</para>
+            </callout>
+            <callout id="co.note.doc_pl080" arearefs="co.doc_pl080" >
+                <para>对应文档下载地址：<ulink url="http://infocentre.arm.com/help/topic/com.arm.doc.ddi0196g/DDI0196.pdf">PL080</ulink></para>
+            </callout>
+            <callout id="co.note.doc_pl081" arearefs="co.doc_pl081" >
+                <para>对应文档下载地址：<ulink url="http://infocentre.arm.com/help/topic/com.arm.doc.ddi0218e/DDI0218.pdf">PL081</ulink></para>
+            </callout>
+        </calloutlist>
+    </programlistingco>
+    <tip><title>Datasheet</title>
+        <para>又称数据手册，是关于硬件资源，功能等详细描述的手册，是做相关驱动开发必不可少的资料，否则，你都不知道你的硬件能做什么事情，就没法去写对应的驱动了。</para>
+    </tip>
+</sect1>
+
+<sect1><title>DMA简述</title>
+    <para>在开始分析代码之前，先简要介绍一下DMA的基础知识。</para>
+    <sect2><title>什么是DMA</title>
+        <para>DMA，Direct Memory Access，直接内存访问。</para>
+        <para>既然叫 直接内存访问，那么相对应地，应该就有 “间接的内存访问”。</para>
+        <para>间接的内存访问，我的理解是，就是指最常见的，我们利用CPU的指令，去从一个内存地址中读出数据，然后写到另外一个内存地址中，完成对应的赋值操作。</para>
+        <para>此过程，完全都是CPU去操作的，如果是单个这样的数据读取和写入，还没啥，但是如果数据量很大，比如我们用memcpy(addr1,addr2，1024)去从地址addr1地址开始，拷贝1024个字节到内存addr2处，那么CPU这段时间，就不要干别的事情了，就一直这么的给你读取，写入数据吧，另外的还有，常见于驱动中的，尤其是涉及到和外设打交道，我们让CPU从内存一个地址，读取了一个数据，然后写入到某个设备的FIFO或者DATA寄存器中，咋写入之前，常常会等待FIFO不是满的，然后才能写入数据，要从FIFO中读取数据，要等到FIFO不是空，才能读取，这样来来回回，会比较消耗资源。</para>
+        <para>鉴于此，才出现了DMA这个硬件设备，专门设计用来处理这些相对用CPU去操作这样的事情，效率很低，换做专门的硬件的DMA来负责数据的读取和写入，释放了CPU这个苦力，可以让，在DMA忙着数据传输的过程中，CPU去忙其他更重要的事情。而专门的DMA硬件负责这样的数据传输，效率也会更高。</para>
+        <para>之所以这样，才叫做内存直接访问的。</para>
+    </sect2>
+    <sect2><title>DMA的一些基础概念</title>
+        <para>DMA传输，总的来说就是：</para>
+        <para>硬件上，会有对应的控制寄存器ctrl和配置寄存器config，</para>
+        <para>比如你想要从内存一个地址addr传输，N个字word（32bit）的数据到设备dev上，</para>
+        <para>那么你就要先去根据你的请求，去配置config寄存器，首先是传输方向，</para>
+        <para>是DMA_TO_DEVICE,然后是源地址source address是你的内存地址addr，</para>
+        <para>和目标destination address是你的dev的DATA寄存器地址，</para>
+        <para>然后要传输额transfer size是N个，每个位宽是32bit，</para>
+        <para>将源地址，目标地址，位宽，DMA传输方向设置好，</para>
+        <para>整理成一个结构，专有名称叫做LLI（Link List Item），把这个LLi设置到ctrl里面。</para>
+        <para>然后去enable DMA，DMA就可以按照你的要求，把数据传输过去了。</para>
+        <para>这样的DMA叫做single DMA传输，LLI中的next lli的域设置为空，表示就一个LLI要传输。</para>
+        <para>如果源地址或目标地址是多个分散的地址，叫做scatter/gather DMA，</para>
+        <para>就要将这些LLI组合一下，即将第一个LLI的next lli那个域，设置成下一个LLI的地址，</para>
+        <para>这样一个个链接起来，最后一个LLI的nex lli的域为空，这样设置好后，将第一个LLI的值写入到ctrl中，DMA就会自动地去执行第一个LLI的数据传输，传完后，发现next lli不为空，就找到next lli的位置，</para>
+        <para>找到对应的配置，开始这个lli的数据传送，直至传完所有的数据为止。</para>
+        <para></para>
+        <para>说完了DMA的由来和基本概念后，下面来分析一下，具体的ARM的PL08x驱动是如何实现的。</para>
+    </sect2>
+</sect1>
+
+<sect1><title>PL08X asynchronous transfer</title>
+    <programlistingco>
+        <programlisting language="c" >
+/*
+ * The AMBA DMA API is modelled on the ISA DMA API and performs<co id="co.isa_dma_api" linkends="co.note.isa_dma_api" />
+ * single asynchronous<co id="co.asynchronous_transf" linkends="co.note.asynchronous_transf" /> transfers between a device and memory
+ * i.e. some platform fixed device address and a driver defined memory address<co id="co.comm_usage" linkends="co.note.comm_usage" />
+        </programlisting>
+        <calloutlist>
+            <callout id="co.note.isa_dma_api" arearefs="co.isa_dma_api" >
+                <para>此AMBA DMA驱动，基于ISA DMA的API，好像应该就是那个DMA engine的架构吧，对应的，是这两个相关文件：</para>
+                <para><filename>\include\linux\dmaengine.h</filename></para>
+                <para><filename>\drivers\dma\dmaengine.c</filename></para>
+            </callout>
+            <callout id="co.note.asynchronous_transf" arearefs="co.asynchronous_transf" >
+                <para>主要实现了异步传输，细看内部实现，就是，你设置好所有的参数之后，就提交你的请求后，然后此dma驱动会去在合适的时候帮你实现你的dma请求。因此，不保证是立刻就去执行你的请求的，此之所以称作异步。</para>
+            </callout>
+            <callout id="co.note.comm_usage" arearefs="co.comm_usage" >
+                <para>正如上面的解释，常见的应用就是，</para>
+                <para>对应某个外设有某个固定的设备地址，一般都是某个FIFO的地址，或者DATA之类的寄存器，然后你的DMA请求是，从内存某个地址传输一定数据到你这个设备的FIFO或者data寄存器，即往你设备里面写数据，或者相反，从你的设备的FIFO地址中，读取一定量数据到内存某个位置，即从你设备里面读取数据。</para>
+            </callout>
+        </calloutlist>
+    </programlistingco>
+</sect1>
+
+<sect1><title>PL08X Memory to peripheral transfer</title>
+    <programlistingco>
+        <programlisting language="c" >
+ *
+ * Memory to peripheral transfer may be visualized as
+ * 	Get data from memory to DMAC
+ *	Until no data left
+ *		On burst request from peripheral
+ *			Destination burst from DMAC to peripheral
+ *			Clear burst request
+ *	Raise terminal count interrupt
+ *
+ * For peripherals with a FIFO:<co id="co.src_dst_fifo_size" linkends="co.note.src_dst_fifo_size" />
+ * Source      burst size == half the depth of the peripheral FIFO
+ * Destination burst size == width of the peripheral FIFO
+        </programlisting>
+        <calloutlist>
+            <callout id="co.note.src_dst_fifo_size" arearefs="co.src_dst_fifo_size" >
+                <para>关于提交DMA传输请求的时候，对于突发传输大小（burst size）的设置，虽然此处建议对于source burst size，设置成你的FIFO大小的一半，而对于destination burst size，设置为你的FIFO大小等同，但是，实际一般是根据你的外设控制器的设置而去具体设置的</para>
+                <para>比如你的nand flash控制器有个fifo是36个word，但是，其nand flash controller中关于burst size的说明是，，DMA模式时候，当fifo中小于4个word并且将要写入数据大于32个word的时候，才会发送write burst信号给dma，要求burst传输，期望一下子传输32个word，</para>
+                <para>这样，一下子传输32个word，写入到nand flash的fifo里面，这样就比dma传输一次一个word，即single word transfer的效率高多了。</para>
+                <para>此时，你的destination burst size，就应该设置成32个word，之前，我以为也可以设置成16，8之类比32小的值，但是除了理论上理解的，没有充分利用硬件的能力、效率低之外，，实际上，驱动并不能正常工作，数据总是少不部分，就是说，硬件上人家有burst的dma请求了，就是已经准备了32个数据让你传，结果你只传输了部分，所以数据就少了一些，就乱了。</para>
+                <para>一般来说，source burst size，多数和destination burst size相等。具体，还要去看你的设备的datasheet。</para>
+            </callout>
+        </calloutlist>
+    </programlistingco>
+</sect1>
+
+
+<sect1><title>PL08X dma_device</title>
+    <programlistingco>
+        <programlisting language="c" >
+ *
+ * (Bursts are irrelevant for mem to mem transfers - there are no burst signals)
+ *
+ * Details of each tranfer on a particular channel
+ * are held in the DMA channel array
+ * A workqueue uses those details to initiate the actual transfer
+ * The DMAC interrupt clears the relevant transfer in the channel array
+ *
+ * ASSUMES only one DMAC device exists in the system
+ * ASSUMES default (little) endianness for DMA transfers
+ *
+ * Only DMAC flow control is implemented
+ *
+ */
+#include &lt;linux/device.h&gt;
+#include &lt;linux/init.h&gt;
+#include &lt;linux/module.h&gt;
+#include &lt;linux/pci.h&gt;
+#include &lt;linux/interrupt.h&gt;
+
+#include &lt;linux/workqueue.h&gt;
+
+#include &lt;linux/dmapool.h&gt;
+#include &lt;asm/dma.h&gt;
+#include &lt;asm/mach/dma.h&gt;
+#include &lt;asm/atomic.h&gt;
+#include &lt;asm/processor.h&gt;
+#include &lt;linux/amba/bus.h&gt;
+
+#include &lt;linux/dmaengine.h&gt;
+#include &lt;asm/cacheflush.h&gt;
+
+#include &lt;linux/amba/pl08x.h&gt;
+int ctr_chan[2];
+
+/*
+ * Predeclare the DMAENGINE API functions
+ */
+static int	pl08x_alloc_chan_resources(struct dma_chan *chan,
+						struct dma_client *client);
+static void	pl08x_free_chan_resources(struct dma_chan *chan);
+static struct	dma_async_tx_descriptor *pl08x_prep_dma_memcpy(
+			struct dma_chan *chan, dma_addr_t dest, dma_addr_t src,
+				size_t len, unsigned long flags);
+static struct dma_async_tx_descriptor *pl08x_prep_dma_interrupt(
+			struct dma_chan *chan, unsigned long flags);
+static enum	dma_status pl08x_dma_is_complete(struct dma_chan *chan,
+					dma_cookie_t cookie, dma_cookie_t *last,
+						dma_cookie_t *used);
+static void	pl08x_issue_pending(struct dma_chan *chan);
+static struct dma_async_tx_descriptor *pl08x_prep_slave_sg(
+		struct dma_chan *chan, struct scatterlist *sgl,
+		unsigned int sg_len, enum dma_data_direction direction,
+		unsigned long flags);
+static void pl08x_terminate_all(struct dma_chan *chan);
+
+struct dma_device<co id="co.dma_device" linkends="co.note.dma_device" /> dmac = {
+	.device_alloc_chan_resources	= pl08x_alloc_chan_resources,
+	.device_free_chan_resources	= pl08x_free_chan_resources,
+	.device_prep_dma_memcpy		= pl08x_prep_dma_memcpy,
+	.device_prep_dma_xor		= NULL,
+	.device_prep_dma_zero_sum	= NULL,
+	.device_prep_dma_memset		= NULL,
+	.device_prep_dma_interrupt	= pl08x_prep_dma_interrupt,
+	.device_is_tx_complete		= pl08x_dma_is_complete,
+	.device_issue_pending		= pl08x_issue_pending,
+	.device_prep_slave_sg		= pl08x_prep_slave_sg,
+	.device_terminate_all		= pl08x_terminate_all,
+};
+        </programlisting>
+        <calloutlist>
+            <callout id="co.note.dma_device" arearefs="co.dma_device" >
+                <para>这个dma_device是在dmaengine.h中定义的</para>
+                <para>其就是定义了一个架构，实现了DMA驱动的与具体设备无关的部分，然后提供具体接口，然后你具体的DMA驱动，去实现对应的接口</para>
+                <para>这样的好处是，省却了你的具体驱动，去关心太多那些通用dma驱动都应该要实现的一些功能等，省却了具体驱动编程者的精力</para>
+            </callout>
+        </calloutlist>
+    </programlistingco>
+</sect1>
+
+<sect1><title>PL08X _cctl_data _cctl</title>
+    <programlistingco>
+        <programlisting language="c" >
+/*
+ * PL08X private data structures  ==== START
+ */
+struct _cctl_data{
+	unsigned int tsize:12;<co id="co.tsize_12" linkends="co.note.tsize_12" />
+	unsigned int sbsize:3;
+	unsigned int dbsize:3;<co id="co.sbsize_dbsize" linkends="co.note.sbsize_dbsize" />
+	unsigned int swidth:3;
+	unsigned int dwidth:3;<co id="co.swidth_dwidth" linkends="co.note.swidth_dwidth" />
+	unsigned int smaster:1;
+	unsigned int dmaster:1;<co id="co.smaster_dmaster" linkends="co.note.smaster_dmaster" />
+	unsigned int si:1;
+	unsigned int di:1;<co id="co.si_di" linkends="co.note.si_di" />
+	unsigned int prot:3;<co id="co.prot_3" linkends="co.note.prot_3" />
+	unsigned int intr:1;<co id="co.intr_1" linkends="co.note.intr_1" />
+};
+union<co id="co._cctl_union" linkends="co.note._cctl_union" /> _cctl{
+	struct _cctl_data bits;
+	unsigned int val;
+};
+        </programlisting>
+        <calloutlist>
+            <callout id="co.note.tsize_12" arearefs="co.tsize_12" >
+                <para>即TransferSize，传输大小，bit0-bit11，共12位。</para>
+                <para>表示，如果当前传输是DMA控制的情况下，当前此次DMA传输要传输的个数，其中每个具体大小是几个字节，由下面的位宽决定。</para>
+                <para>在配置完dma，开始传输后，此传输大小从你设置的值，即要传输的数，一点点减少直至0.如果读取此域，得到的值，表示当前还剩下多少个要传输。</para>
+                <para>不过特殊一点是，如果当前正在进行DMA传输，由于正在传输，所以你读取到的值，并不一定是真正的还剩多少个要传输的。一般用法是，在启用DMA传输，后来又由于传输完成后或者出错等特殊情况又禁用了DMA，此时再去读此域的值，就能真正有效地表示还多少没有传输的。</para>
+                <para>如果不是DMA控制数据流的传输，（之后会提到，关于DMA数据传输方向，除了DMA_TO_DEVICE，DMA_FROM_DEVICE之外，还有MEM_TO_MEM之类的，非DMA控制数据传输的情况）那么就应该在开始配置的时候，将此域值设置成0.</para>
+            </callout>
+            <callout id="co.note.sbsize_dbsize" arearefs="co.sbsize_dbsize" >
+                <para>即source burst size和destination burst size，即前面提到的，当设备发送给DMA控制器一个突发传输信号之后，DMA要传输多少个数据，就由此处设置的值决定。</para>
+                <para>支持的burst size有1，4，8，。。。，128，256。</para>
+                <para>前面已经解释过了，具体此处需要设置成多少，要根据你的硬件的datasheet中描述的你的硬件的能力去决定。</para>
+                <para>Datasheet中写的DMACxBREQ信号线，就是设备的控制器，如果支持DMA，都会有此信号线接出来的，这样，接到DMA的对应的DMACxBREQ引脚上，这样，如果设备控制器，发现当前的条件，满足DMA burst传输，比如FIFO一共36个word，发现FIFO中数据&amp;=32个word了，快满了，就会向DMA控制器PL080，通过这个信号线发送burst read请求，然后PL080就会根据你DMA传输前此处设置的值，比如是32，去你的设备的FIFO中，一次性地读取你之前设置的32个word。</para>
+                <para>其中具体满足什么条件，才会触发DMA burst读取或写入的请求信号，都是对应你的设备的控制器的datasheet中描述的，也就是你的硬件本身的能力决定的。.</para>
+            </callout>
+            <callout id="co.note.swidth_dwidth" arearefs="co.swidth_dwidth" >
+                <para>即source width和destination width。</para>
+                <para>具体支持的位宽类型有，byte（8bit），half word（16bit），word（32bit）等。</para>
+                <para>关于source和destination，解释一下，</para>
+                <para>比如，你要从你的设备读取数据，即从你设备的FIFO中读取数据到内存某个位置，那么你的设备就是source，此时你的设备的FIFO的位宽，就是source width，比如你FIFO位宽是32bit的，那么此处，根据datasheet，就应该设置为word（32bit）。</para>
+            </callout>
+            <callout id="co.note.smaster_dmaster" arearefs="co.smaster_dmaster" >
+                <para>即source master和destination master，当你的传输由DMA控制时，</para>
+                <para>比如上面说的DMA_FROM_DEVICE，DMA从设备的FIFO中读取数据到内存中，此时，你要设置一下，你的DMA是用哪一个，即source master是谁。因为，此处的DMA的控制者有2个，可以简单理解为，有两个dma控制器，master1和master2，你具体选哪个master来控制你的DMA传输。关于master的选择，后面的代码分析中，会再次提及。</para>
+            </callout>
+            <callout id="co.note.si_di" arearefs="co.si_di" >
+                <para>即source increment和destination increment，此处可翻译为，源地址递增和目标地址递增，</para>
+                <para>关于什么叫递增，为何要递增，可以从最开始提到的，DMA的常见应用情况中来解释，</para>
+                <para>因为常见的DMA传输，是从某个设备读取数据到某块内存区域，即DMA_FROM_DEVICE，以DMA模式，将数据“From从”你的设备中，读取到某块内存里面；或者将某块内存区域内数据，写入到设备里面，即DMA_TO_DEVICE。</para>
+                <para>而设备往往都是只有一个DATA寄存器（或是FIFO），此地址是固定不变的，</para>
+                <para>因此：</para>
+                <para>对于DMA_FROM_DEVICE，你传输完一个数据了，再传下一个数据的时候，此时你的Source源，还是你的设备的那个寄存器的地址，没有变化，而目标地址，往往要增加一个你的destination width，比如是一个word，32bit，4个字节，即地址要加4了，对应的就要将destination increment设置成1，表示，你的dma每次传输完，目标地址要增加的。</para>
+                <para>当然具体增加的大小，由你的设置的destination width的值决定。</para>
+                <para>相应地，如果是DMA_TO_DEVICE，那么就是DMA将数据从内存中写入到你的设备里面，每次传输完后，就是源source地址要增加，source increment要设置为1.</para>
+                <para>同理，如果是MEM_TO_MEM类型的，内存到内存，就是两者都要设置成1了，因为DMA传输完单个数据后，源地址和目标地址都要改变，要增加相应位宽的大小的。</para>
+            </callout>
+            <callout id="co.note.prot_3" arearefs="co.prot_3" >
+                <para>即Protection，保护位，共3bit。</para>
+                <para>一般很少用到此域，我也没有完全理解，故不多解释，仅简述其义：</para>
+                <orderedlist>
+                    <listitem>Bit0
+                        <para>0是普通用户模式,1是特权模式</para>
+                    </listitem>
+                    <listitem>Bit1
+                        <para>0是non-bufferable，1是bufferable</para>
+                    </listitem>
+                    <listitem>Bit2
+                        <para>0是non-cacheable，1是cacheable</para>
+                    </listitem>
+                </orderedlist>
+            </callout>
+            <callout id="co.note.intr_1" arearefs="co.intr_1" >
+                <para>是否启用计数终止中断（Terminal count interrupt）。</para>
+                <para>关于此位，之前一直很迷惑，后面终于看懂了。</para>
+                <para>就是说，对于DMA的传输中的单个LLI来说，当前传输完成了，对应的寄存器中的transfer size域的值，也就是从设置的值，递减到0，也就是此计数递减到0，即结束了，即terminal count，而Terminal Count Interrupt，即传输完了，达到了terminal count时候，发送一个中断，告诉设备此次传输完成了。</para>
+                <para>如果此位被设置为0，那么传输完当前的LLI，就不会发送这个中断了，设置为1，就发送此中断。</para>
+            </callout>
+            <callout id="co.note._cctl_union" arearefs="co._cctl_union" >
+                <para>此处之所以定义成union类型，就是方便，在设置好了之后，将此32位的值，直接写入对应的32位的寄存器中。</para>
+            </callout>
+        </calloutlist>
+    </programlistingco>
+</sect1>
+
+<sect1><title>PL08X _lli _chan_lli pl08x_driver_data</title>
+    <programlistingco>
+        <programlisting language="c" >
+/*
+ * An LLI struct - see pl08x TRM
+ * Note that next uses bit[0] as a bus bit,
+ * start &amp; end do not - their bus bit info
+ * is in cctl
+ */
+struct _lli<co id="co._lli" linkends="co.note._lli" />{
+	dma_addr_t src;
+	dma_addr_t dst;
+	dma_addr_t next;<co id="co.lli_next" linkends="co.note.lli_next" />
+	union _cctl cctl;
+};
+struct _chan_lli<co id="co._chan_lli" linkends="co.note._chan_lli" /> {
+	dma_addr_t bus_list;
+	void	*va_list;
+};
+struct pl08x_driver_data {
+	void __iomem	*base;<co id="co.drv_base" linkends="co.note.drv_base" />
+	struct amba_device<co id="co.amba_device" linkends="co.note.amba_device" /> *dmac;
+	struct pl08x_platform_data *pd;
+	/*
+	 * Single dma_pool for the LLIs
+	 */
+	struct dma_pool *pool;<co id="co.dma_pool" linkends="co.note.dma_pool" />
+	int pool_ctr;<co id="co.pool_ctr" linkends="co.note.pool_ctr" />
+	struct work_struct dwork;<co id="co.pool_ws" linkends="co.note.pool_ws" />
+	wait_queue_head_t *waitq;
+	int max_num_llis;
+	/*
+	 * LLI details for each DMA channel
+	 */
+	struct _chan_lli *chanllis;
+	/* Wrappers for the struct dma_chan */
+	struct pl08x_dma_chan<co id="co.pl08x_dma_chan" linkends="co.note.pl08x_dma_chan" /> *chanwrap[MAX_DMA_CHANNELS];
+	/* List of descriptors which can be freed */
+	spinlock_t 		lock;
+};
+/*
+ * PL08X private data structures  ==== END
+ */
+        </programlisting>
+        <calloutlist>
+            <callout id="co.note._lli" arearefs="co._lli" >
+                <para>这个就是DMA里面最核心的概念，LLI，Link List Item，包括了</para>
+                <orderedlist>
+                    <listitem>源地址</listitem>
+                    <listitem>目标地址</listitem>
+                    <listitem>下一个LLI的地址
+                        <para>如果其为0/NULL/空，说明当前只需要传输一个信息，如果非空，传完当前的LLI，就会跳转到对应的地址，执行下一个LLI的传输</para>
+                    </listitem>
+                    <listitem>对应的控制信息cctrl - channel control</listitem>
+                </orderedlist>
+                <para>这四个值，会分别写入到对应的四个寄存器。</para>
+                <para>这样配置好了之后，再去启用DMA，DMA就会按照你的要求，把数据从源地址传送到目的地址。</para>
+            </callout>
+            <callout id="co.note.lli_next" arearefs="co.lli_next" >
+                <para>next域的值，即下一个LLI的地址，其中的bit0，是bus bit，即指示当前用哪个bus。</para>
+                <para>现将datasheet中相关解释截图如下：</para>
+                <figure id="fg.lli_reg"><title>LLI寄存器的含义</title>
+                    <mediaobject>
+                        <imageobject role="html">
+                            <imagedata fileref="images/lli_reg.png" align="left" scalefit="0" width="100%" />
+                        </imageobject>
+                        <imageobject role="fo">
+                            <imagedata fileref="images/lli_reg.png" align="center" scalefit="1" width="100%"/>
+                        </imageobject>
+                    </mediaobject>
+                </figure>
+                <para>对应的bit[0],LM位，就表示了，当前使用哪个AHB master，而真正的LLI的地址，是存放在bit[2-31]</para>
+            </callout>
+            <callout id="co.note._chan_lli" arearefs="co._chan_lli" >
+                <para>LLI结构体，存放LLI的dma地址（供DMA控制器访问的） bus_list，和虚拟地址（普通的地址，CPU可以访问的地址），va_list</para>
+            </callout>
+            <callout id="co.note.drv_base" arearefs="co.drv_base" >
+                <para>记录对dma控制器硬件基地址ioremap之后的，驱动中可以直接访问的那个基地址</para>
+                <para>加上对应寄存器偏移量，就可以访问寄存器了</para>
+            </callout>
+            <callout id="co.note.amba_device" arearefs="co.amba_device" >
+                <para> 此pl08x的DMA控制也是一个amba设备</para>
+            </callout>
+            <callout id="co.note.dma_pool" arearefs="co.dma_pool" >
+                <para>dma内存池，用于存放之后，每次驱动的LLI</para>
+            </callout>
+            <callout id="co.note.pool_ctr" arearefs="co.pool_ctr" >
+                <para>记录已使用内存池的数量，当达到足够大一个值的时候，做一次清理动作</para>
+            </callout>
+            <callout id="co.note.pool_ws" arearefs="co.pool_ws" >
+                <para>一个工作队列，后面可以看到，挂了一个函数，作用是清理释放dma pool</para>
+            </callout>
+            <callout id="co.note.pl08x_dma_chan" arearefs="co.pl08x_dma_chan" >
+                <para>将DMA 通道相关的信息，打包在这个变量里</para>
+            </callout>
+        </calloutlist>
+    </programlistingco>
+</sect1>
+
+<sect1><title>PL08X macros</title>
+    <programlistingco>
+        <programlisting language="c" >
+/*
+ * Power Management.
+ * PM support is not complete. Turn it off.<co id="co.no_pm" linkends="co.note.no_pm" />
+ */
+#undef CONFIG_PM
+
+#ifdef CONFIG_PM
+#else
+# define pl08x_do_suspend	NULL
+# define pl08x_do_resume 	NULL
+# define pl08x_suspend		NULL
+# define pl08x_resume		NULL
+#endif
+
+#ifdef MODULE
+
+# error "AMBA PL08X DMA CANNOT BE COMPILED AS A LOADABLE MODULE AT PRESENT"
+
+/*
+	a) Some devices might make use of DMA during boot
+	   (esp true for DMAENGINE implementation)
+	b) Memory allocation will need much more attention
+	   before load/unload can be supported
+ */
+#endif
+
+struct pl08x_driver_data pd;
+
+/*
+ * PL08X specific defines
+ */
+/* Minimum period between work queue runs */
+#define PL08X_WQ_PERIODMIN	20
+/* Size (bytes) of each buffer allocated for one transfer */
+# define PL08X_LLI_TSFR_SIZE	0x2000<co id="co.max_xfer_size" linkends="co.note.max_xfer_size" />
+/* Maximimum times we call dma_pool_alloc on this pool without freeing */
+# define PL08X_MAX_ALLOCS	0x40
+#define MAX_NUM_TSFR_LLIS 	(PL08X_LLI_TSFR_SIZE/sizeof(struct _lli))<co id="co.max_lli_num" linkends="co.note.max_lli_num" />
+#define PL08X_ALIGN		8
+#define PL08X_ALLOC		0
+
+/* Register offsets */<co id="co.regs_offset" linkends="co.note.regs_offset" />
+#define	PL08X_OS_ISR		0x00
+#define	PL08X_OS_ISR_TC		0x04
+#define	PL08X_OS_ICLR_TC	0x08
+#define	PL08X_OS_ISR_ERR	0x0C
+#define	PL08X_OS_ICLR_ERR	0x10
+#define	PL08X_OS_CFG		0x30
+#define	PL08X_OS_CCFG		0x10
+#define	PL08X_OS_ENCHNS		0x1C
+#define	PL08X_OS_CHAN		0x20
+#define	PL08X_OS_CHAN_BASE	0x100
+
+/* Channel registers */<co id="co.chan_regs" linkends="co.note.chan_regs" />
+#define	PL08X_OS_CSRC		0x00
+#define	PL08X_OS_CDST		0x04
+#define	PL08X_OS_CLLI		0x08
+#define	PL08X_OS_CCTL		0x0C
+/* register masks */
+#define	PL08X_MASK_CFG		0xFFFFFFF1
+#define	PL08X_MASK_EN		0x00000001
+#define	PL08X_MASK_CLLI		0x00000002
+#define	PL08X_MASK_TSFR_SIZE	0x00000FFF
+#define	PL08X_MASK_INTTC	0x00008000
+#define	PL08X_MASK_INTERR	0x00004000
+#define	PL08X_MASK_CCFG		0x00000000
+#define	PL08X_MASK_HALT		0x00040000
+#define	PL08X_MASK_ACTIVE	0x00020000
+#define	PL08X_MASK_CEN		0x00000001
+#define	PL08X_MASK_ENCHNS	0x000000FF
+#define PL08X_WIDTH_8BIT	0x00
+#define PL08X_WIDTH_16BIT	0x01
+#define PL08X_WIDTH_32BIT	0x02
+
+/*<co id="co.not_use_follow" linkends="co.note.not_use_follow" />
+ * Transferring less than this number of bytes as bytes
+ * is faster than calculating the required LLIs....
+ * (8 is the real minimum
+ * >7 bytes must have a word alignable transfer somewhere)
+ */
+#define PL08X_BITESIZE		0x10
+/*
+ * Flow control bit masks<co id="co.not_use_follow_2" linkends="co.note.not_use_follow_2" />
+ */
+#define PL08X_FCMASK_M2M_DMA	0x00000000
+#define PL08X_FCMASK_M2P_DMA	0x00000800
+#define PL08X_FCMASK_P2M_DMA	0x00001000
+#define PL08X_FCMASK_P2P_DMA	0x00001800
+#define PL08X_FCMASK_P2P_DST	0x00002000
+#define PL08X_FCMASK_M2P_PER	0x00002800
+#define PL08X_FCMASK_P2P_PER	0x00003000
+#define PL08X_FCMASK_P2P_SRC	0x00003800
+/* Max number of transfers which can be coded in the control register */
+#define PL08X_MAX_TSFRS		0xFFF
+
+#define PL08X_CODING_ERR	0xFFFFFFFF
+        </programlisting>
+        <calloutlist>
+            <callout id="co.note.no_pm" arearefs="co.no_pm" >
+                <para>暂时没有实现Linux中PM 的支持</para>
+            </callout>
+            <callout id="co.note.max_xfer_size" arearefs="co.max_xfer_size" >
+                <para>对于其他使用此DMA 的驱动中，会去提交DMA请求，此处就是指一次DMA请求中，最大所允许的传输大小，此处是0x2000= 8192</para>
+            </callout>
+            <callout id="co.note.max_lli_num" arearefs="co.max_lli_num" >
+                <para>后面代码中会看到，对于你的驱动提交的DMA请求，此DMA驱动内部会自动帮你转换成对应的一个个LLI，此数值就是限制一次DMA请求中，最大支持多少个LLI</para>
+            </callout>
+            <callout id="co.note.regs_offset" arearefs="co.regs_offset" >
+                <para>一些全局的寄存器的偏移地址，这些值都是根据datasheet中定义出来的</para>
+            </callout>
+            <callout id="co.note.chan_regs" arearefs="co.chan_regs" >
+                <para>DMA控制器，有很多个通道channel，每个channel都对应有自己的一些寄存器，下面就是这些寄存器的地址偏移和位域值的含义</para>
+            </callout>
+            <callout id="co.note.not_use_follow" arearefs="co.not_use_follow" >
+                <para>下面这几个宏定义，好像没用到</para>
+            </callout>
+            <callout id="co.note.not_use_follow_2" arearefs="co.not_use_follow_2" >
+                <para>下面这个宏定义，好像也没用到，具体的流控制flow control的设置以及宏定义，在对应头文件中：</para>
+                <programlisting>
+#define PL08X_CCFG_FCTL_MEM_TO_MEM		(0)
+#define PL08X_CCFG_FCTL_MEM_TO_PERI		(1)
+                </programlisting>
+            </callout>
+        </calloutlist>
+    </programlistingco>
+</sect1>
+
+<sect1 id="pl08x_decode_widthbits" ><title>pl08x_decode_widthbits</title>
+    <programlistingco>
+        <programlisting language="c" >
+static unsigned int pl08x_decode_widthbits<co id="co.decode_widthbits" linkends="co.note.decode_widthbits" />(unsigned int coded)
+{
+	if (coded &lt; 3)<co id="co.lt_than_3" linkends="co.note.lt_than_3" />
+		return 1 &lt;&lt; coded;
+
+	dev_err(&amp;pd.dmac-&gt;dev, "%s - illegal width bits 0x%08x\n", __func__,
+						coded);
+	return PL08X_CODING_ERR;
+}
+        </programlisting>
+        <calloutlist>
+            <callout id="co.note.decode_widthbits" arearefs="co.decode_widthbits" >
+                <para>根据设置的值，解码出实际位的宽度</para>
+            </callout>
+            <callout id="co.note.lt_than_3" arearefs="co.lt_than_3" >
+                <para>根据datasheet中的解释：</para>
+                <figure id="fg.swidth_spec"><title>Souce Transfer Width</title>
+                    <mediaobject>
+                        <imageobject role="html">
+                            <imagedata fileref="images/swidth_spec.png" align="left" scalefit="0" width="100%" />
+                        </imageobject>
+                        <imageobject role="fo">
+                            <imagedata fileref="images/swidth_spec.png" align="center" scalefit="1" width="100%"/>
+                        </imageobject>
+                    </mediaobject>
+                </figure>
+                <figure id="fg.swidth_dwidth"><title>Souce or Destination Transfer Width</title>
+                    <mediaobject>
+                        <imageobject role="html">
+                            <imagedata fileref="images/swidth_dwidth.png" align="left" scalefit="0" width="100%" />
+                        </imageobject>
+                        <imageobject role="fo">
+                            <imagedata fileref="images/swidth_dwidth.png" align="center" scalefit="1" width="100%"/>
+                        </imageobject>
+                    </mediaobject>
+                </figure>
+                <para>所以，目前只支持8.，16,32字节，位域的值分别是0，1, 2</para>
+                <para>所以此处判断小于3，才是有效的</para>
+                <para>然后1&lt;&lt;coded，得到的结果分别是1,2,4个字节。</para>
+            </callout>
+        </calloutlist>
+    </programlistingco>
+</sect1>
+
+<sect1><title>pl08x_encode_width</title>
+    <programlistingco>
+        <programlisting language="c" >
+static unsigned int pl08x_encode_width<co id="co.rev_of_dec_width" linkends="co.note.rev_of_dec_width" />(unsigned int unencoded)
+{
+	unsigned int retval = unencoded &gt;&gt; 1;
+
+	if (unencoded == (1 &lt;&lt; retval))
+		return retval;
+
+	dev_err(&amp;pd.dmac-&gt;dev, "%s - illegal width 0x%08x\n", __func__,
+						unencoded);
+	return PL08X_CODING_ERR;
+}
+        </programlisting>
+        <calloutlist>
+            <callout id="co.note.rev_of_dec_width" arearefs="co.rev_of_dec_width" >
+                <para>上述函数<xref linkend="pl08x_decode_widthbits" />的逆过程</para>
+            </callout>
+        </calloutlist>
+    </programlistingco>
+</sect1>
+
+<sect1><title>pl08x_choose_master_bus</title>
+    <programlistingco>
+        <programlisting language="c" >
+/*
+ * - prefers destination bus if both available
+ * - if fixed address on one bus chooses other
+ */
+void pl08x_choose_master_bus<co id="co.pl08x_choose_master_bus" linkends="co.note.pl08x_choose_master_bus" />(struct pl08x_bus_data *src_bus,
+	struct pl08x_bus_data *dst_bus, struct pl08x_bus_data **mbus,
+	struct pl08x_bus_data **sbus, union _cctl *cctl_parm)
+{
+	if (!cctl_parm-&gt;bits.di) {
+		*mbus = src_bus;<co id="co.src_is_master" linkends="co.note.src_is_master" />
+		*sbus = dst_bus;
+	} else if (!cctl_parm-&gt;bits.si)	{
+		*mbus = dst_bus;
+		*sbus = src_bus;
+	} else {
+/* TODO: ??? */
+		if (dst_bus-&gt;buswidth == 4) {
+			*mbus = dst_bus;
+			*sbus = src_bus;
+		} else if (src_bus-&gt;buswidth == 4) {
+			*mbus = src_bus;
+			*sbus = dst_bus;
+		} else if (dst_bus-&gt;buswidth == 2) {
+			*mbus = dst_bus;
+			*sbus = src_bus;
+		} else if (src_bus-&gt;buswidth == 2) {
+			*mbus = src_bus;
+			*sbus = dst_bus;
+		} else {
+			/* src_bus-&gt;buswidth == 1 */
+			*mbus = dst_bus;
+			*sbus = src_bus;
+		}
+	}
+}
+        </programlisting>
+        <calloutlist>
+            <callout id="co.note.pl08x_choose_master_bus" arearefs="co.pl08x_choose_master_bus" >
+                <para>根据传入的是源自增SI还是DI目的地址自增，决定谁是master bus</para>
+            </callout>
+            <callout id="co.note.src_is_master" arearefs="co.src_is_master" >
+                <para>如果是 非DI，不是目标地址自增，那么就用src作为master bus 以实际常用的情况举例，比如要从某个buffer传输数据到nand flash的DATA寄存器中，那么就是DI为0，而作为主方向的buffer，就是master bus，从master的buffer传输到slave 的nand flash的DATA寄存器</para>
+            </callout>
+        </calloutlist>
+    </programlistingco>
+</sect1>
+
+<sect1><title>pl08x_fill_lli_for_desc</title>
+    <programlistingco>
+        <programlisting language="c" >
+int pl08x_fill_lli_for_desc(struct pl08x_txd *local_txd, int num_llis, int len,
+				union _cctl *cctl, int *remainder)
+{
+	struct _lli *llis_va = (struct _lli *)(local_txd-&gt;llis_va);
+	struct _lli *llis_bus = (struct _lli *)(local_txd-&gt;llis_bus);
+	llis_va[num_llis].cctl.val	= cctl-&gt;val;<co id="co.fill_cctl" linkends="co.note.fill_cctl" />
+	llis_va[num_llis].src		= local_txd-&gt;srcbus.addr;
+	llis_va[num_llis].dst		= local_txd-&gt;dstbus.addr;
+	/*
+	 * The bus bit is added to the next lli's address
+	 */
+	llis_va[num_llis].next =
+		(dma_addr_t)((unsigned int)&amp;(llis_bus[num_llis + 1]<co id="co.num_list_1" linkends="co.note.num_list_1" />)
+					+ pd.pd-&gt;bus_bit_lli<co id="co.bus_bit_lli" linkends="co.note.bus_bit_lli" />);
+	if (cctl-&gt;bits.si)
+		local_txd-&gt;srcbus.addr += len;<co id="co.addr_inc_len" linkends="co.note.addr_inc_len" />
+	if (cctl-&gt;bits.di)
+		local_txd-&gt;dstbus.addr += len;
+
+	*remainder -= len;
+
+	return num_llis + 1;
+}
+        </programlisting>
+        <calloutlist>
+            <callout id="co.note.fill_cctl" arearefs="co.fill_cctl" >
+                <para>填充对应的contrl，source, destination 三个寄存器对应的值</para>
+            </callout>
+            <callout id="co.note.num_list_1" arearefs="co.num_list_1" >
+                <para>llis_bus[num_llis + 1]比较好理解，就是当前的LLI的next的值，应该赋值为下一个LLI 的地址</para>
+            </callout>
+            <callout id="co.note.bus_bit_lli" arearefs="co.bus_bit_lli" >
+                <para>需要特殊说明的是bus_bit_lli，此变量，意思为你当前使用DMA的哪个Master。</para>
+                <para>因为pl080内部有两个Master主控器，你在使用DMA的时候，要制定你当前是使用哪一个DMA，详情参考datasheet：</para>
+                <figure id="fg.lli_reg_bits"><title>LLI寄存器的含义</title>
+                    <mediaobject>
+                        <imageobject role="html">
+                            <imagedata fileref="images/lli_reg_bits.png" align="left" scalefit="0" width="100%" />
+                        </imageobject>
+                        <imageobject role="fo">
+                            <imagedata fileref="images/lli_reg_bits.png" align="center" scalefit="1" width="100%"/>
+                        </imageobject>
+                    </mediaobject>
+                </figure>
+                <para>其中32位的LLI的地址，由于是4对齐的，所以bit0和bit1肯定是0，正好利用第0位指示是master1 还是master2。</para>
+                <para>此变量不是此处pl08x DMA驱动赋值的，而是在你最开始去注册amba设备的时候赋值的。 </para>
+            </callout>
+            <callout id="co.note.addr_inc_len" arearefs="co.addr_inc_len" >
+                <para>如果是SI，那么源地址在一次LLI的DMA传输后，源地址就应该更新，为再加上对应的每次传输的长度</para>
+            </callout>
+        </calloutlist>
+    </programlistingco>
+</sect1>
+
+<sect1><title>pl08x_pre_boundary</title>
+    <programlistingco>
+        <programlisting language="c" >
+/*
+ * Return number of bytes to fill to boundary, or len
+ */
+static int pl08x_pre_boundary(int addr, int len)
+{
+	int boundary;
+
+	if (len &lt;= 0)
+		dev_err(&amp;pd.dmac-&gt;dev, "%s - zero length\n", __func__);
+	boundary = ((addr &gt;&gt; PL08X_BOUNDARY_SHIFT<co id="co.boundary" linkends="co.note.boundary" />) + 1) &lt;&lt; PL08X_BOUNDARY_SHIFT;
+
+	if (boundary &lt; addr + len)
+		return boundary - addr;
+	else
+		return len;
+}
+        </programlisting>
+        <calloutlist>
+            <callout id="co.note.boundary" arearefs="co.boundary" >
+                <para><filename>Pl08x.h</filename>中定义的：</para>
+<programlisting>
+#define PL08X_BOUNDARY_SHIFT	(10)	/* 1KB 0x400 */
+#define PL08X_BOUNDARY_SIZE		(1 &lt;&lt; PL08X_BOUNDARY_SHIFT)
+</programlisting>
+                <para>此函数，目的是为了限制每次DMA传输的字节数，要保证在PL08X_BOUNDARY_SIZE即1KB范围内。</para>
+                <para>之所以做此限制，是因为datasheet中写了：<quote>Bursts do not cross the 1KB address boundary</quote></para>
+                <para>突发传输，不能跨界超过1KB 的范围。</para>
+                <para>所以，如果你上层程序调用此pl08x驱动，希望每次传输2KB，那么此驱动会自动帮你限制为每次最多1KB，然后自动帮你拆分出对应的多个LLI。</para>
+            </callout>
+        </calloutlist>
+    </programlistingco>
+</sect1>
+
+</chapter>

@@ -1,0 +1,70 @@
+<?xml version='1.0' encoding="utf-8"?>
+
+<!DOCTYPE book
+[
+
+<!ENTITY cur_book_name      "dma_pl08x_analysis" >
+<!ENTITY publish_date       "2012-09-01" >
+<!ENTITY release_version    "1.1" >
+
+<!ENTITY copyrith_year "2012" >
+<!ENTITY entity_common_multi_format     SYSTEM  "../../entity_common_multi_format.xml">
+<!ENTITY entity_common_publish_info     SYSTEM  "../../entity_common_publish_info.xml">
+]>
+
+<book version="5.0"
+    xmlns="http://docbook.org/ns/docbook"
+    xmlns:xi="http://www.w3.org/2001/XInclude"
+    xmlns:xl="http://www.w3.org/1999/xlink"
+    xml:lang="zh_CN"
+    >
+
+<info>
+    <title>详解ARM的AMBA设备中的DMA设备PL08X的Linux驱动</title>
+    <subtitle></subtitle>
+    <keywordset>
+        <keyword>ARM</keyword>
+        <keyword>DMA</keyword>
+        <keyword>PL08X</keyword>
+        <keyword>AMBA</keyword>
+        <keyword>Linux</keyword>
+        <keyword>驱动</keyword>
+    </keywordset>
+
+    <abstract>
+        <para>本文主要分析了Linux的DMA驱动中ARM的PL08X的实现细节，几乎详细分析了每一个函数的主体代码，同时介绍了DMA的基本概念和工作原理。</para>
+        &entity_common_multi_format;
+    </abstract>
+
+    <revhistory>
+        <revision>
+            <revnumber>1.0</revnumber>
+            <date>2010-04-23</date>
+            <revremark>
+                <orderedlist>
+                    <listitem>详解ARM的AMBA设备中的DMA设备PL08X的Linux驱动</listitem>
+                </orderedlist>
+            </revremark>
+            <authorinitials>crl</authorinitials>
+        </revision>
+        <revision>
+            <revnumber>&release_version;</revnumber>
+            <date>&publish_date;</date>
+            <revremark>
+                <orderedlist>
+                    <listitem>通过Docbook发布</listitem>
+                </orderedlist>
+            </revremark>
+            <authorinitials>crl</authorinitials>
+        </revision>
+    </revhistory>
+
+    &entity_common_publish_info;
+</info>
+
+<xi:include href="preface.xml"/>
+<xi:include href="ch01_pl08x_analysis_1.xml"/>
+<xi:include href="ch02_pl08x_analysis_2.xml"/>
+<xi:include href="ch03_pl08x_analysis_3.xml"/>
+
+</book>
